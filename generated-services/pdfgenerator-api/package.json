@@ -1,0 +1,20 @@
+{
+  "name": "pdfgenerator-api",
+  "version": "1.0.1",
+  "description": "Self-service HTML-to-PDF conversion API with templates and Stripe-powered paid access.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pdf-lib": "^1.17.1",
+    "rate-limiter-flexible": "^5.0.5",
+    "stripe": "^17.7.0"
+  }
+}
