@@ -1,540 +1,929 @@
+require('dotenv').config();
+
 const express = require('express');
+const { randomBytes, randomUUID } = require('crypto');
 const puppeteer = require('puppeteer');
-const Stripe = require('stripe');
-const { v4: uuidv4 } = require('uuid');
-const helmet = require('helmet');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
-const yaml = require('js-yaml');
-const fs = require('fs');
-const path = require('path');
-const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const multer = require('multer');
-const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number.parseInt(process.env.PORT || '3000', 10);
+const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+const MAX_FREE_RENDERS = Number.parseInt(
+  process.env.MAX_FREE_RENDERS_PER_MONTH || '100',
+  10
+);
+const MAX_BATCH_SIZE = Number.parseInt(process.env.MAX_BATCH_SIZE || '20', 10);
+const MAX_HTML_LENGTH = Number.parseInt(
+  process.env.MAX_HTML_LENGTH || '2000000',
+  10
+);
 
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const API_KEY = process.env.API_KEY || 'dev-api-key-change-me';
-const NODE_ENV = process.env.NODE_ENV || 'development';
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? require('stripe')(process.env.STRIPE_SECRET_KEY)
+  : null;
 
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' }) : null;
+const configuredKeys = String(process.env.API_KEYS || 'demo-key')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
-const TIERS = {
-  free: { monthlyRenders: 100, asyncBatch: false, watermark: true, customFonts: false, priority: false, dedicatedWorkers: false },
-  starter: { monthlyRenders: 1000, asyncBatch: true, watermark: false, customFonts: false, priority: false, dedicatedWorkers: false, priceId: process.env.STRIPE_PRICE_STARTER },
-  pro: { monthlyRenders: 10000, asyncBatch: true, watermark: false, customFonts: true, priority: true, dedicatedWorkers: false, priceId: process.env.STRIPE_PRICE_PRO },
-  enterprise: { monthlyRenders: 100000, asyncBatch: true, watermark: false, customFonts: true, priority: true, dedicatedWorkers: true, priceId: process.env.STRIPE_PRICE_ENTERPRISE }
-};
+const configuredPremiumKeys = String(process.env.PREMIUM_API_KEYS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
-const apiKeys = new Map();
-const usage = new Map();
+const validKeys = new Set(configuredKeys);
+const premiumKeys = new Set(configuredPremiumKeys);
 const templates = new Map();
-const asyncJobs = new Map();
-const webhooks = new Map();
+const usage = new Map();
+const jobs = new Map();
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+let browserPromise = null;
+let server = null;
 
-function authenticateApiKey(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid Authorization header. Use: Bearer <api_key>' });
-  }
-  const apiKey = authHeader.substring(7);
-  const keyData = apiKeys.get(apiKey);
-  if (!keyData) {
-    return res.status(401).json({ error: 'Invalid API key' });
-  }
-  req.apiKey = apiKey;
-  req.keyData = keyData;
-  req.tier = keyData.tier || 'free';
-  next();
+function createApiKey() {
+  return `pdf_live_${randomBytes(24).toString('hex')}`;
 }
 
-function checkRateLimit(req, res, next) {
-  const keyData = req.keyData;
-  const tierLimits = TIERS[keyData.tier] || TIERS.free;
-  const currentMonth = new Date().toISOString().slice(0, 7);
-  const usageKey = `${keyData.id}:${currentMonth}`;
-  const currentUsage = usage.get(usageKey) || 0;
-
-  if (currentUsage >= tierLimits.monthlyRenders) {
-    return res.status(429).json({
-      error: 'Monthly render limit exceeded',
-      tier: keyData.tier,
-      limit: tierLimits.monthlyRenders,
-      used: currentUsage,
-      upgradeUrl: '/api/billing/portal'
-    });
-  }
-  next();
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => {
+    const entities = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    };
+    return entities[character];
+  });
 }
 
-function incrementUsage(apiKeyId) {
-  const currentMonth = new Date().toISOString().slice(0, 7);
-  const usageKey = `${apiKeyId}:${currentMonth}`;
-  usage.set(usageKey, (usage.get(usageKey) || 0) + 1);
+function resolvePath(object, path) {
+  return path.split('.').reduce((current, key) => {
+    if (current === null || current === undefined) {
+      return undefined;
+    }
+    return current[key];
+  }, object);
 }
 
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+function renderTemplate(template, data = {}) {
+  return String(template).replace(
+    /\{\{\{\s*([\w.]+)\s*\}\}\}|\{\{\s*([\w.]+)\s*\}\}/g,
+    (match, rawPath, escapedPath) => {
+      const path = rawPath || escapedPath;
+      const value = resolvePath(data, path);
 
-const globalLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 200,
-  message: { error: 'Too many requests, please try again later' }
-});
-app.use(globalLimiter);
-
-let browser = null;
-async function getBrowser() {
-  if (!browser || !browser.isConnected()) {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-    });
-  }
-  return browser;
-}
-
-function generateApiKey(tier = 'free') {
-  const apiKey = `pdfgen_${uuidv4().replace(/-/g, '')}`;
-  const keyData = { id: uuidv4(), tier, createdAt: new Date().toISOString() };
-  apiKeys.set(apiKey, keyData);
-  return { apiKey, ...keyData };
-}
-
-function renderWatermark(page, text) {
-  return page.evaluate((watermarkText) => {
-    const style = document.createElement('style');
-    style.textContent = `
-      @media print {
-        body::after {
-          content: "${watermarkText}";
-          position: fixed;
-          top: 50%;
-          left: 50%;
-          transform: translate(-50%, -50%) rotate(-45deg);
-          font-size: 120px;
-          color: rgba(0,0,0,0.08);
-          z-index: 9999;
-          pointer-events: none;
-          white-space: nowrap;
-          font-family: sans-serif;
-        }
+      if (value === null || value === undefined) {
+        return '';
       }
-    `;
-    document.head.appendChild(style);
-  }, text);
+
+      return rawPath ? String(value) : escapeHtml(value);
+    }
+  );
 }
 
-async function generatePdfFromHtml(html, options = {}) {
-  const browserInstance = await getBrowser();
-  const page = await browserInstance.newPage();
+function injectWatermark(html, watermark) {
+  if (!watermark) {
+    return html;
+  }
+
+  const watermarkMarkup = [
+    '<div style="position:fixed;',
+    'top:50%;left:50%;',
+    'transform:translate(-50%,-50%) rotate(-35deg);',
+    'font-family:Arial,sans-serif;',
+    'font-size:84px;',
+    'font-weight:700;',
+    'color:rgba(80,80,80,0.12);',
+    'z-index:2147483647;',
+    'pointer-events:none;',
+    'white-space:nowrap;">',
+    escapeHtml(watermark),
+    '</div>'
+  ].join('');
+
+  if (/<body[\s>]/i.test(html)) {
+    return html.replace(/<body([^>]*)>/i, `<body$1>${watermarkMarkup}`);
+  }
+
+  return `${watermarkMarkup}${html}`;
+}
+
+function monthKey() {
+  const now = new Date();
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function getUsage(apiKey) {
+  const currentMonth = monthKey();
+  let entry = usage.get(apiKey);
+
+  if (!entry || entry.month !== currentMonth) {
+    entry = {
+      month: currentMonth,
+      count: 0
+    };
+    usage.set(apiKey, entry);
+  }
+
+  return entry;
+}
+
+function isPremium(apiKey) {
+  return premiumKeys.has(apiKey);
+}
+
+function assertAllowance(apiKey, amount = 1) {
+  if (isPremium(apiKey)) {
+    return;
+  }
+
+  const entry = getUsage(apiKey);
+
+  if (entry.count + amount > MAX_FREE_RENDERS) {
+    const error = new Error(
+      `Free tier limit of ${MAX_FREE_RENDERS} PDF renders per month would be exceeded.`
+    );
+    error.status = 429;
+    throw error;
+  }
+}
+
+function incrementUsage(apiKey, amount = 1) {
+  const entry = getUsage(apiKey);
+  entry.count += amount;
+}
+
+function extractApiKey(req) {
+  const directKey = req.get('x-api-key');
+
+  if (directKey) {
+    return directKey.trim();
+  }
+
+  const authorization = req.get('authorization') || '';
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function requireApiKey(req, res, next) {
+  const apiKey = extractApiKey(req);
+
+  if (!apiKey || (!validKeys.has(apiKey) && !premiumKeys.has(apiKey))) {
+    return res.status(401).json({
+      error: 'A valid API key is required in x-api-key or Authorization: Bearer.'
+    });
+  }
+
+  req.apiKey = apiKey;
+  return next();
+}
+
+function validateHtml(html) {
+  if (typeof html !== 'string' || html.trim().length === 0) {
+    const error = new Error('HTML must be a non-empty string.');
+    error.status = 400;
+    throw error;
+  }
+
+  if (html.length > MAX_HTML_LENGTH) {
+    const error = new Error(
+      `HTML exceeds the maximum length of ${MAX_HTML_LENGTH} characters.`
+    );
+    error.status = 413;
+    throw error;
+  }
+}
+
+function prepareDocument(body) {
+  const input = body || {};
+  let html;
+
+  if (input.templateId) {
+    const template = templates.get(String(input.templateId));
+
+    if (!template) {
+      const error = new Error(`Template "${input.templateId}" was not found.`);
+      error.status = 404;
+      throw error;
+    }
+
+    html = renderTemplate(template.html, input.data || {});
+  } else {
+    html = input.html;
+  }
+
+  validateHtml(html);
+
+  const options =
+    input.options && typeof input.options === 'object' ? input.options : {};
+
+  return {
+    html: injectWatermark(html, options.watermark),
+    options
+  };
+}
+
+function normalizeMargin(margin) {
+  if (!margin || typeof margin !== 'object') {
+    return {
+      top: '20mm',
+      right: '15mm',
+      bottom: '20mm',
+      left: '15mm'
+    };
+  }
+
+  return {
+    top: String(margin.top || '20mm'),
+    right: String(margin.right || '15mm'),
+    bottom: String(margin.bottom || '20mm'),
+    left: String(margin.left || '15mm')
+  };
+}
+
+function buildPdfOptions(options) {
+  const pageNumbers = Boolean(options.pageNumbers);
+  const hasHeader = typeof options.headerTemplate === 'string';
+  const hasFooter = typeof options.footerTemplate === 'string';
+  const displayHeaderFooter = pageNumbers || hasHeader || hasFooter;
+
+  const defaultHeader =
+    '<div style="width:100%;font-size:8px;color:#777;padding:0 15mm;"></div>';
+  const defaultFooter = pageNumbers
+    ? '<div style="width:100%;font-size:9px;color:#666;text-align:center;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>'
+    : '<div style="width:100%;font-size:8px;color:#777;padding:0 15mm;"></div>';
+
+  const pdfOptions = {
+    printBackground: options.printBackground !== false,
+    landscape: Boolean(options.landscape),
+    preferCSSPageSize: Boolean(options.preferCSSPageSize),
+    displayHeaderFooter,
+    headerTemplate: hasHeader ? options.headerTemplate : defaultHeader,
+    footerTemplate: hasFooter ? options.footerTemplate : defaultFooter,
+    margin: normalizeMargin(options.margin)
+  };
+
+  if (typeof options.format === 'string' && options.format.trim()) {
+    pdfOptions.format = options.format.trim();
+  } else {
+    pdfOptions.format = 'A4';
+  }
+
+  if (typeof options.scale === 'number') {
+    pdfOptions.scale = Math.min(2, Math.max(0.1, options.scale));
+  }
+
+  return pdfOptions;
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = puppeteer
+      .launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu'
+        ]
+      })
+      .catch((error) => {
+        browserPromise = null;
+        throw error;
+      });
+  }
+
+  return browserPromise;
+}
+
+async function generatePdf(document) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
 
   try {
-    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 60000 });
+    await page.setContent(document.html, {
+      waitUntil: ['domcontentloaded', 'networkidle0'],
+      timeout: 30000
+    });
 
-    if (options.watermark) {
-      await renderWatermark(page, options.watermarkText || 'Generated by PdfGenerator API - Free Tier');
-    }
+    if (
+      document.options &&
+      Number.isFinite(Number(document.options.waitForMilliseconds))
+    ) {
+      const delay = Math.min(
+        5000,
+        Math.max(0, Number(document.options.waitForMilliseconds))
+      );
 
-    if (options.customFonts && options.customFonts.length > 0) {
-      for (const font of options.customFonts) {
-        await page.addStyleTag({
-          content: `@font-face { font-family: '${font.family}'; src: url('${font.url}') format('${font.format || 'woff2'}'); }`
-        });
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
 
-    const pdfOptions = {
-      format: options.format || 'A4',
-      printBackground: true,
-      margin: options.margin || { top: '20mm', right: '15mm', bottom: '20mm', left: '15mm' },
-      displayHeaderFooter: options.headerTemplate || options.footerTemplate || options.pageNumbers,
-      headerTemplate: options.headerTemplate || '',
-      footerTemplate: options.footerTemplate || (options.pageNumbers ? `
-        <div style="width: 100%; text-align: center; font-size: 10px; color: #666; padding: 5px;">
-          <span class="pageNumber"></span> / <span class="totalPages"></span>
-        </div>
-      ` : ''),
-      preferCSSPageSize: true,
-      tagged: options.pdfA || false
-    };
-
-    const pdfBuffer = await page.pdf(pdfOptions);
-    return pdfBuffer;
+    const pdf = await page.pdf(buildPdfOptions(document.options || {}));
+    return Buffer.from(pdf);
   } finally {
     await page.close();
   }
 }
 
-async function mergePdfs(pdfBuffers) {
-  const mergedPdf = await PDFDocument.create();
-  for (const buffer of pdfBuffers) {
-    const pdf = await PDFDocument.load(buffer);
-    const copiedPages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
-    copiedPages.forEach(page => mergedPdf.addPage(page));
-  }
-  return Buffer.from(await mergedPdf.save());
+function publicJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    createdAt: job.createdAt,
+    completedAt: job.completedAt || null,
+    documents: job.documents.map((document) => ({
+      id: document.id,
+      status: document.status,
+      error: document.error || null,
+      downloadUrl:
+        document.status === 'completed'
+          ? `/api/jobs/${job.id}/documents/${document.id}/pdf`
+          : null
+    }))
+  };
 }
 
-function applyTemplate(template, data) {
-  let html = template.html;
-  for (const [key, value] of Object.entries(data)) {
-    const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
-    html = html.replace(regex, value);
+async function processBatch(job, requests) {
+  job.status = 'processing';
+
+  for (let index = 0; index < requests.length; index += 1) {
+    const jobDocument = job.documents[index];
+
+    try {
+      jobDocument.status = 'processing';
+      const document = prepareDocument(requests[index]);
+      jobDocument.pdf = await generatePdf(document);
+      jobDocument.status = 'completed';
+    } catch (error) {
+      jobDocument.status = 'failed';
+      jobDocument.error = error.message;
+    }
   }
-  return html;
+
+  job.status = job.documents.some((document) => document.status === 'failed')
+    ? 'completed_with_errors'
+    : 'completed';
+  job.completedAt = new Date().toISOString();
 }
+
+function priceIdForPlan(plan) {
+  const prices = {
+    starter: process.env.STRIPE_STARTER_PRICE_ID,
+    pro: process.env.STRIPE_PRO_PRICE_ID,
+    business: process.env.STRIPE_BUSINESS_PRICE_ID
+  };
+
+  return prices[plan] || null;
+}
+
+async function activateCheckoutSession(sessionId) {
+  if (!stripe) {
+    const error = new Error('Stripe billing is not configured.');
+    error.status = 503;
+    throw error;
+  }
+
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+  if (
+    session.payment_status !== 'paid' &&
+    session.payment_status !== 'no_payment_required'
+  ) {
+    const error = new Error('The checkout session has not been paid.');
+    error.status = 402;
+    throw error;
+  }
+
+  const apiKey = session.metadata && session.metadata.apiKey;
+
+  if (!apiKey) {
+    const error = new Error('The checkout session does not contain an API key.');
+    error.status = 500;
+    throw error;
+  }
+
+  premiumKeys.add(apiKey);
+  return {
+    apiKey,
+    plan: session.metadata.plan || 'paid',
+    customerId: session.customer || null,
+    subscriptionId: session.subscription || null
+  };
+}
+
+app.disable('x-powered-by');
+
+app.post(
+  '/api/billing/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+      return res.status(503).json({
+        error: 'Stripe webhook processing is not configured.'
+      });
+    }
+
+    const signature = req.get('stripe-signature');
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      return res.status(400).json({
+        error: `Invalid Stripe webhook: ${error.message}`
+      });
+    }
+
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const apiKey = session.metadata && session.metadata.apiKey;
+
+        if (apiKey) {
+          premiumKeys.add(apiKey);
+        }
+      }
+
+      if (
+        event.type === 'customer.subscription.deleted' ||
+        event.type === 'customer.subscription.paused'
+      ) {
+        const subscription = event.data.object;
+        const apiKey = subscription.metadata && subscription.metadata.apiKey;
+
+        if (apiKey) {
+          premiumKeys.delete(apiKey);
+        }
+      }
+
+      return res.json({ received: true });
+    } catch (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+  }
+);
+
+app.use(express.json({ limit: '3mb' }));
+
+app.get('/', (req, res) => {
+  res.json({
+    service: 'PdfGenerator API',
+    status: 'online',
+    documentation: '/api',
+    health: '/api/health'
+  });
+});
+
+app.get('/api', (req, res) => {
+  res.json({
+    name: 'PdfGenerator API',
+    version: '1.0.0',
+    authentication: [
+      'x-api-key: demo-key',
+      'Authorization: Bearer demo-key'
+    ],
+    endpoints: {
+      health: 'GET /api/health',
+      pricing: 'GET /api/pricing',
+      usage: 'GET /api/usage',
+      createTemplate: 'POST /api/templates',
+      listTemplates: 'GET /api/templates',
+      deleteTemplate: 'DELETE /api/templates/:id',
+      renderPdf: 'POST /api/render',
+      createBatch: 'POST /api/batches',
+      getJob: 'GET /api/jobs/:id',
+      downloadBatchPdf: 'GET /api/jobs/:jobId/documents/:documentId/pdf',
+      checkout: 'POST /api/billing/checkout',
+      activateCheckout: 'POST /api/billing/activate'
+    }
+  });
+});
 
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'pdf-generator-api',
-    version: '1.0.0',
     timestamp: new Date().toISOString(),
-    browser: browser ? 'connected' : 'not initialized'
+    stripeConfigured: Boolean(stripe),
+    uptimeSeconds: Math.floor(process.uptime())
   });
 });
 
-app.post('/api/keys', async (req, res) => {
-  const { tier = 'free', email } = req.body;
-  if (!Object.keys(TIERS).includes(tier)) {
-    return res.status(400).json({ error: 'Invalid tier', validTiers: Object.keys(TIERS) });
-  }
-  if (tier !== 'free' && !stripe) {
-    return res.status(503).json({ error: 'Stripe not configured. Paid tiers unavailable.' });
-  }
-
-  const keyResult = generateApiKey(tier);
-  if (tier !== 'free' && stripe) {
-    try {
-      const customer = await stripe.customers.create({ email, metadata: { apiKeyId: keyResult.id } });
-      keyResult.stripeCustomerId = customer.id;
-      keyResult.subscriptionUrl = `/api/billing/checkout?priceId=${TIERS[tier].priceId}&customerId=${customer.id}`;
-    } catch (e) {
-      console.error('Stripe customer creation failed:', e.message);
-    }
-  }
-  res.status(201).json(keyResult);
-});
-
-app.post('/api/render', authenticateApiKey, checkRateLimit, async (req, res) => {
-  const { html, templateId, data, options = {} } = req.body;
-  const tierLimits = TIERS[req.tier] || TIERS.free;
-
-  if (!html && !templateId) {
-    return res.status(400).json({ error: 'Either html or templateId is required' });
-  }
-
-  let finalHtml = html;
-  if (templateId) {
-    const template = templates.get(templateId);
-    if (!template) {
-      return res.status(404).json({ error: 'Template not found' });
-    }
-    finalHtml = applyTemplate(template, data || {});
-  }
-
-  const renderOptions = {
-    format: options.format || 'A4',
-    margin: options.margin,
-    headerTemplate: options.headerTemplate,
-    footerTemplate: options.footerTemplate,
-    pageNumbers: options.pageNumbers !== false,
-    watermark: tierLimits.watermark && !options.removeWatermark,
-    watermarkText: options.watermarkText,
-    customFonts: tierLimits.customFonts ? (options.customFonts || []) : [],
-    pdfA: options.pdfA || false
-  };
-
-  try {
-    const pdfBuffer = await generatePdfFromHtml(finalHtml, renderOptions);
-    incrementUsage(req.keyData.id);
-
-    res.set({
-      'Content-Type': 'application/pdf',
-      'Content-Length': pdfBuffer.length,
-      'X-Renders-Remaining': tierLimits.monthlyRenders - (usage.get(`${req.keyData.id}:${new Date().toISOString().slice(0,7)}`) || 0)
-    });
-    res.send(pdfBuffer);
-  } catch (error) {
-    console.error('Render error:', error);
-    res.status(500).json({ error: 'PDF generation failed', details: error.message });
-  }
-});
-
-app.post('/api/templates', authenticateApiKey, async (req, res) => {
-  const { name, html, description } = req.body;
-  if (!name || !html) {
-    return res.status(400).json({ error: 'name and html are required' });
-  }
-  const templateId = uuidv4();
-  templates.set(templateId, { id: templateId, name, html, description, createdAt: new Date().toISOString(), ownerId: req.keyData.id });
-  res.status(201).json({ id: templateId, name, description });
-});
-
-app.get('/api/templates', authenticateApiKey, (req, res) => {
-  const userTemplates = Array.from(templates.values()).filter(t => t.ownerId === req.keyData.id);
-  res.json(userTemplates);
-});
-
-app.get('/api/templates/:id', authenticateApiKey, (req, res) => {
-  const template = templates.get(req.params.id);
-  if (!template || template.ownerId !== req.keyData.id) {
-    return res.status(404).json({ error: 'Template not found' });
-  }
-  res.json(template);
-});
-
-app.delete('/api/templates/:id', authenticateApiKey, (req, res) => {
-  const template = templates.get(req.params.id);
-  if (!template || template.ownerId !== req.keyData.id) {
-    return res.status(404).json({ error: 'Template not found' });
-  }
-  templates.delete(req.params.id);
-  res.status(204).send();
-});
-
-app.post('/api/batch', authenticateApiKey, async (req, res) => {
-  const tierLimits = TIERS[req.tier] || TIERS.free;
-  if (!tierLimits.asyncBatch) {
-    return res.status(403).json({ error: 'Async batch processing not available on free tier. Upgrade to Starter or higher.' });
-  }
-
-  const { items, webhookUrl, options = {} } = req.body;
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'items array is required' });
-  }
-  if (items.length > 100) {
-    return res.status(400).json({ error: 'Maximum 100 items per batch' });
-  }
-
-  const jobId = uuidv4();
-  const job = {
-    id: jobId,
-    status: 'pending',
-    items: items.map((item, index) => ({ ...item, index, status: 'pending' })),
-    webhookUrl,
-    options,
-    createdAt: new Date().toISOString(),
-    completedAt: null,
-    results: []
-  };
-  asyncJobs.set(jobId, job);
-
-  processBatchJob(jobId, req.keyData.id, req.tier).catch(console.error);
-
-  res.status(202).json({ jobId, status: 'pending', statusUrl: `/api/batch/${jobId}` });
-});
-
-async function processBatchJob(jobId, apiKeyId, tier) {
-  const job = asyncJobs.get(jobId);
-  if (!job) return;
-
-  job.status = 'processing';
-  const tierLimits = TIERS[tier] || TIERS.free;
-
-  for (const item of job.items) {
-    item.status = 'processing';
-    try {
-      let finalHtml = item.html;
-      if (item.templateId) {
-        const template = templates.get(item.templateId);
-        if (template) finalHtml = applyTemplate(template, item.data || {});
+app.get('/api/pricing', (req, res) => {
+  res.json({
+    currency: 'usd',
+    plans: [
+      {
+        id: 'free',
+        priceMonthly: 0,
+        rendersPerMonth: MAX_FREE_RENDERS,
+        batchSize: MAX_BATCH_SIZE
+      },
+      {
+        id: 'starter',
+        priceMonthly: 9,
+        rendersPerMonth: 1000,
+        batchSize: MAX_BATCH_SIZE
+      },
+      {
+        id: 'pro',
+        priceMonthly: 29,
+        rendersPerMonth: 10000,
+        batchSize: MAX_BATCH_SIZE
+      },
+      {
+        id: 'business',
+        priceMonthly: 79,
+        rendersPerMonth: 'unlimited',
+        batchSize: MAX_BATCH_SIZE
       }
-
-      const renderOptions = {
-        format: job.options.format || 'A4',
-        margin: job.options.margin,
-        headerTemplate: job.options.headerTemplate,
-        footerTemplate: job.options.footerTemplate,
-        pageNumbers: job.options.pageNumbers !== false,
-        watermark: tierLimits.watermark,
-        customFonts: tierLimits.customFonts ? (job.options.customFonts || []) : [],
-        pdfA: job.options.pdfA || false
-      };
-
-      const pdfBuffer = await generatePdfFromHtml(finalHtml, renderOptions);
-      incrementUsage(apiKeyId);
-
-      const base64Pdf = pdfBuffer.toString('base64');
-      item.status = 'completed';
-      item.result = { pdfBase64: base64Pdf, size: pdfBuffer.length };
-      job.results.push({ index: item.index, pdfBase64: base64Pdf, size: pdfBuffer.length });
-    } catch (error) {
-      item.status = 'failed';
-      item.error = error.message;
-      job.results.push({ index: item.index, error: error.message });
-    }
-  }
-
-  job.status = job.items.every(i => i.status === 'completed') ? 'completed' : 'partial_failure';
-  job.completedAt = new Date().toISOString();
-
-  if (job.webhookUrl) {
-    try {
-      await axios.post(job.webhookUrl, {
-        jobId,
-        status: job.status,
-        results: job.results,
-        completedAt: job.completedAt
-      }, { timeout: 10000 });
-    } catch (e) {
-      console.error('Webhook delivery failed:', e.message);
-    }
-  }
-}
-
-app.get('/api/batch/:jobId', authenticateApiKey, (req, res) => {
-  const job = asyncJobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json(job);
+    ]
+  });
 });
 
-app.post('/api/merge', authenticateApiKey, checkRateLimit, upload.array('pdfs'), async (req, res) => {
-  if (!req.files || req.files.length < 2) {
-    return res.status(400).json({ error: 'At least 2 PDF files required' });
-  }
-
+app.post('/api/billing/checkout', async (req, res, next) => {
   try {
-    const pdfBuffers = req.files.map(f => f.buffer);
-    const mergedBuffer = await mergePdfs(pdfBuffers);
-    incrementUsage(req.keyData.id);
+    if (!stripe) {
+      const error = new Error('Stripe billing is not configured.');
+      error.status = 503;
+      throw error;
+    }
 
-    res.set({
-      'Content-Type': 'application/pdf',
-      'Content-Length': mergedBuffer.length
-    });
-    res.send(mergedBuffer);
-  } catch (error) {
-    console.error('Merge error:', error);
-    res.status(500).json({ error: 'PDF merge failed', details: error.message });
-  }
-});
+    const plan = String(req.body.plan || '').toLowerCase();
+    const priceId = priceIdForPlan(plan);
 
-app.post('/api/billing/checkout', authenticateApiKey, async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
-  const { priceId, customerId } = req.body;
-  if (!priceId) return res.status(400).json({ error: 'priceId required' });
+    if (!priceId) {
+      const error = new Error(
+        'Plan must be starter, pro, or business, and its Stripe price ID must be configured.'
+      );
+      error.status = 400;
+      throw error;
+    }
 
-  try {
+    const apiKey = createApiKey();
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      payment_method_types: ['card'],
-      line_items: [{ price: priceId, quantity: 1 }],
-      customer: customerId || undefined,
-      success_url: `${req.headers.origin || 'http://localhost:3000'}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${req.headers.origin || 'http://localhost:3000'}/cancel`,
-      metadata: { apiKeyId: req.keyData.id }
-    });
-    res.json({ url: session.url, sessionId: session.id });
-  } catch (e) {
-    console.error('Checkout error:', e);
-    res.status(500).json({ error: 'Failed to create checkout session' });
-  }
-});
-
-app.post('/api/billing/portal', authenticateApiKey, async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
-  const keyData = req.keyData;
-  if (!keyData.stripeCustomerId) {
-    return res.status(400).json({ error: 'No Stripe customer associated. Subscribe first.' });
-  }
-  try {
-    const session = await stripe.billingPortal.sessions.create({
-      customer: keyData.stripeCustomerId,
-      return_url: req.headers.origin || 'http://localhost:3000'
-    });
-    res.json({ url: session.url });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to create portal session' });
-  }
-});
-
-app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
-    return res.status(400).send('Webhook secret not configured');
-  }
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error('Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const apiKeyId = session.metadata?.apiKeyId;
-    if (apiKeyId) {
-      for (const [key, data] of apiKeys.entries()) {
-        if (data.id === apiKeyId) {
-          data.tier = getTierFromPriceId(session.subscription?.price_id) || 'starter';
-          data.stripeCustomerId = session.customer;
-          data.stripeSubscriptionId = session.subscription;
-          apiKeys.set(key, data);
-          break;
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1
+        }
+      ],
+      allow_promotion_codes: true,
+      success_url: `${PUBLIC_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${PUBLIC_URL}/billing/cancelled`,
+      metadata: {
+        apiKey,
+        plan
+      },
+      subscription_data: {
+        metadata: {
+          apiKey,
+          plan
         }
       }
-    }
-  } else if (event.type === 'customer.subscription.deleted') {
-    const subscription = event.data.object;
-    for (const [key, data] of apiKeys.entries()) {
-      if (data.stripeSubscriptionId === subscription.id) {
-        data.tier = 'free';
-        apiKeys.set(key, data);
-        break;
-      }
-    }
-  }
+    });
 
-  res.json({ received: true });
+    return res.status(201).json({
+      checkoutUrl: session.url,
+      sessionId: session.id,
+      plan
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
-function getTierFromPriceId(priceId) {
-  for (const [tier, config] of Object.entries(TIERS)) {
-    if (config.priceId === priceId) return tier;
-  }
-  return null;
-}
+app.post('/api/billing/activate', async (req, res, next) => {
+  try {
+    const sessionId = String(req.body.sessionId || '').trim();
 
-app.get('/api/usage', authenticateApiKey, (req, res) => {
-  const currentMonth = new Date().toISOString().slice(0, 7);
-  const usageKey = `${req.keyData.id}:${currentMonth}`;
-  const currentUsage = usage.get(usageKey) || 0;
-  const tierLimits = TIERS[req.tier] || TIERS.free;
+    if (!sessionId) {
+      const error = new Error('sessionId is required.');
+      error.status = 400;
+      throw error;
+    }
+
+    const activation = await activateCheckoutSession(sessionId);
+    return res.json(activation);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get('/billing/success', async (req, res) => {
+  try {
+    const sessionId = String(req.query.session_id || '').trim();
+
+    if (!sessionId) {
+      return res.status(400).type('html').send(
+        '<!doctype html><html><body><h1>Missing checkout session</h1></body></html>'
+      );
+    }
+
+    const activation = await activateCheckoutSession(sessionId);
+
+    return res.type('html').send(
+      `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PdfGenerator API subscription active</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f7fb;color:#172033;margin:0;padding:40px}
+main{max-width:720px;margin:40px auto;background:#fff;border-radius:14px;padding:32px;box-shadow:0 12px 40px rgba(20,35,70,.12)}
+code{display:block;overflow-wrap:anywhere;background:#101827;color:#d8f3dc;padding:16px;border-radius:8px}
+</style>
+</head>
+<body>
+<main>
+<h1>Subscription active</h1>
+<p>Your ${escapeHtml(activation.plan)} API key is ready. Store it securely because it grants access to paid PDF rendering.</p>
+<code>${escapeHtml(activation.apiKey)}</code>
+<p>Send the key using the x-api-key header or Authorization: Bearer.</p>
+</main>
+</body>
+</html>`
+    );
+  } catch (error) {
+    return res.status(error.status || 500).type('html').send(
+      `<!doctype html><html><body><h1>Activation failed</h1><p>${escapeHtml(
+        error.message
+      )}</p></body></html>`
+    );
+  }
+});
+
+app.get('/billing/cancelled', (req, res) => {
+  res.type('html').send(
+    '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Checkout cancelled</title></head><body><h1>Checkout cancelled</h1><p>No subscription was created.</p></body></html>'
+  );
+});
+
+app.use('/api', requireApiKey);
+
+app.get('/api/usage', (req, res) => {
+  const entry = getUsage(req.apiKey);
+  const premium = isPremium(req.apiKey);
+
   res.json({
-    tier: req.tier,
-    currentMonth,
-    used: currentUsage,
-    limit: tierLimits.monthlyRenders,
-    remaining: Math.max(0, tierLimits.monthlyRenders - currentUsage),
-    features: tierLimits
+    month: entry.month,
+    renders: entry.count,
+    plan: premium ? 'paid' : 'free',
+    limit: premium ? null : MAX_FREE_RENDERS,
+    remaining: premium
+      ? null
+      : Math.max(0, MAX_FREE_RENDERS - entry.count)
   });
 });
 
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
+app.post('/api/templates', (req, res, next) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    const html = req.body.html;
 
-app.listen(PORT, () => {
-  console.log(`PdfGenerator API listening on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
-  if (NODE_ENV === 'development') {
-    const devKey = generateApiKey('free');
-    console.log(`Dev API Key: ${devKey.apiKey}`);
+    if (!name) {
+      const error = new Error('Template name is required.');
+      error.status = 400;
+      throw error;
+    }
+
+    validateHtml(html);
+
+    const id = randomUUID();
+    const template = {
+      id,
+      name,
+      html,
+      createdAt: new Date().toISOString()
+    };
+
+    templates.set(id, template);
+
+    return res.status(201).json({
+      id: template.id,
+      name: template.name,
+      createdAt: template.createdAt
+    });
+  } catch (error) {
+    return next(error);
   }
 });
 
-process.on('SIGTERM', async () => {
-  if (browser) await browser.close();
+app.get('/api/templates', (req, res) => {
+  const result = Array.from(templates.values()).map((template) => ({
+    id: template.id,
+    name: template.name,
+    createdAt: template.createdAt
+  }));
+
+  res.json({
+    templates: result
+  });
+});
+
+app.delete('/api/templates/:id', (req, res) => {
+  if (!templates.delete(req.params.id)) {
+    return res.status(404).json({
+      error: 'Template not found.'
+    });
+  }
+
+  return res.status(204).end();
+});
+
+app.post('/api/render', async (req, res, next) => {
+  try {
+    assertAllowance(req.apiKey, 1);
+    const document = prepareDocument(req.body);
+    const pdf = await generatePdf(document);
+    incrementUsage(req.apiKey, 1);
+
+    const filename = String(req.body.filename || 'document.pdf')
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/\.pdf$/i, '');
+
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${filename}.pdf"`,
+      'Content-Length': String(pdf.length),
+      'Cache-Control': 'no-store'
+    });
+
+    return res.send(pdf);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post('/api/batches', (req, res, next) => {
+  try {
+    const documents = req.body.documents;
+
+    if (!Array.isArray(documents) || documents.length === 0) {
+      const error = new Error('documents must be a non-empty array.');
+      error.status = 400;
+      throw error;
+    }
+
+    if (documents.length > MAX_BATCH_SIZE) {
+      const error = new Error(
+        `A batch may contain at most ${MAX_BATCH_SIZE} documents.`
+      );
+      error.status = 400;
+      throw error;
+    }
+
+    assertAllowance(req.apiKey, documents.length);
+
+    for (const document of documents) {
+      prepareDocument(document);
+    }
+
+    incrementUsage(req.apiKey, documents.length);
+
+    const job = {
+      id: randomUUID(),
+      ownerApiKey: req.apiKey,
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+      completedAt: null,
+      documents: documents.map(() => ({
+        id: randomUUID(),
+        status: 'queued',
+        pdf: null,
+        error: null
+      }))
+    };
+
+    jobs.set(job.id, job);
+
+    setImmediate(() => {
+      processBatch(job, documents).catch((error) => {
+        job.status = 'failed';
+        job.completedAt = new Date().toISOString();
+
+        for (const document of job.documents) {
+          if (document.status !== 'completed') {
+            document.status = 'failed';
+            document.error = error.message;
+          }
+        }
+      });
+    });
+
+    return res.status(202).json(publicJob(job));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.get('/api/jobs/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+
+  if (!job || job.ownerApiKey !== req.apiKey) {
+    return res.status(404).json({
+      error: 'Job not found.'
+    });
+  }
+
+  return res.json(publicJob(job));
+});
+
+app.get(
+  '/api/jobs/:jobId/documents/:documentId/pdf',
+  (req, res) => {
+    const job = jobs.get(req.params.jobId);
+
+    if (!job || job.ownerApiKey !== req.apiKey) {
+      return res.status(404).json({
+        error: 'Job not found.'
+      });
+    }
+
+    const document = job.documents.find(
+      (item) => item.id === req.params.documentId
+    );
+
+    if (!document) {
+      return res.status(404).json({
+        error: 'Batch document not found.'
+      });
+    }
+
+    if (document.status !== 'completed' || !document.pdf) {
+      return res.status(409).json({
+        error: 'The PDF is not ready.',
+        status: document.status
+      });
+    }
+
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${document.id}.pdf"`,
+      'Content-Length': String(document.pdf.length),
+      'Cache-Control': 'no-store'
+    });
+
+    return res.send(document.pdf);
+  }
+);
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Route not found.'
+  });
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  const status = Number.isInteger(error.status) ? error.status : 500;
+
+  return res.status(status).json({
+    error: status >= 500 ? 'Internal server error.' : error.message,
+    details:
+      status >= 500 && process.env.NODE_ENV !== 'production'
+        ? error.message
+        : undefined
+  });
+});
+
+async function shutdown(signal) {
+  if (server) {
+    server.close();
+  }
+
+  if (browserPromise) {
+    try {
+      const browser = await browserPromise;
+      await browser.close();
+    } catch (error) {
+      console.error('Browser shutdown error:', error.message);
+    }
+  }
+
+  console.log(`${signal} received. Shutdown complete.`);
   process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`PdfGenerator API listening on port ${PORT}`);
 });
