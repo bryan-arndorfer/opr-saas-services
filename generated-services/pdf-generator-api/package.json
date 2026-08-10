@@ -1,0 +1,25 @@
+{
+  "name": "pdf-generator-api",
+  "version": "1.0.0",
+  "description": "Monetized HTML-to-PDF generation API for Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.1.0",
+    "pdf-lib": "^1.17.1",
+    "puppeteer": "^24.16.0",
+    "stripe": "^18.4.0",
+    "uuid": "^11.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}
