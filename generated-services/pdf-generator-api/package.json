@@ -1,25 +1,28 @@
 {
   "name": "pdf-generator-api",
   "version": "1.0.0",
-  "description": "Monetized HTML-to-PDF generation API for Railway",
+  "description": "HTML-to-PDF conversion API with asynchronous processing and Stripe monetization",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
+    "worker": "node worker.js",
     "test": "node test.js"
   },
   "dependencies": {
+    "bullmq": "^5.8.0",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "express-rate-limit": "^7.5.0",
-    "helmet": "^8.1.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.4.1",
+    "jsonschema": "^1.4.1",
     "pdf-lib": "^1.17.1",
-    "puppeteer": "^24.16.0",
-    "stripe": "^18.4.0",
-    "uuid": "^11.1.0"
+    "puppeteer": "^22.10.0",
+    "stripe": "^14.21.0",
+    "uuid": "^9.0.1"
   },
   "engines": {
     "node": ">=20.0.0"
-  },
-  "license": "MIT"
+  }
 }
