@@ -1,181 +1,113 @@
-# PDF Generator API
+# PdfGenerator API
 
-PDF Generator API is a self-service HTML-to-PDF micro-SaaS built with Express, Puppeteer, PDF-Lib, Stripe, and Railway.
-
-## Features
-
-- HTML and CSS to PDF conversion
-- Reusable user-owned templates
-- Template variable interpolation
-- Page formats, margins, landscape mode, headers, and footers
-- Free-tier PDF watermarking
-- PDF merging
-- API-key authentication
-- Monthly usage quotas
-- Stripe subscription checkout
-- Stripe webhook-based plan activation and cancellation
-- JSON-file persistence
-- Railway health checks
-- Docker deployment
-- End-to-end health, registration, rendering, and usage test
-
-Remote HTTP and HTTPS resources referenced by submitted HTML are blocked during rendering. Inline CSS, data URLs, and embedded assets remain available.
+PdfGenerator API converts HTML and CSS into PDFs through a self-service HTTP API. It supports synchronous rendering, queued rendering, reusable templates, watermarks, custom fonts, PDF merging, usage limits, and Stripe subscriptions.
 
 ## Requirements
 
 - Node.js 20 or newer
-- Chromium when running outside the provided Docker image
-- Stripe credentials for paid subscriptions
+- Redis for asynchronous jobs
+- Stripe for paid subscriptions
 
 ## Local installation
 
-Install dependencies:
+1. Run `npm install`.
+2. Copy `.env.example` to `.env`.
+3. Start the API with `npm start`.
+4. Start the worker in another process with `npm run worker`.
+5. Run integration tests with `npm test`.
 
-    npm install
+Redis and Stripe are optional for synchronous free-tier rendering. Redis is required for asynchronous rendering and merging. Stripe is required for checkout.
 
-Start the API:
+## Create an API key
 
-    API_KEY_SALT=development-secret npm start
+Send a POST request to `/api/keys`.
 
-The service listens on port 3000 by default.
+Example:
 
-Check health:
+`curl -X POST http://localhost:3000/api/keys -H "Content-Type: application/json" -d '{}'`
 
-    curl http://localhost:3000/api/health
+The response contains a free API key. Save it and send it as a bearer token on authenticated requests.
 
-## Environment variables
+## Render a PDF
 
-Required for production:
+Example:
 
-- API_KEY_SALT: Secret used to hash API keys
-- APP_URL: Public origin of the deployed service
+`curl -X POST http://localhost:3000/api/render -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" -d '{"html":"<h1>Hello World</h1>","css":"h1{color:blue}","options":{"format":"A4"}}' --output document.pdf`
 
-Required for Stripe subscriptions:
+## Render an invoice template
 
-- STRIPE_SECRET_KEY: Stripe secret API key
-- STRIPE_WEBHOOK_SECRET: Signing secret for the Stripe webhook
-- STRIPE_PRICE_STARTER: Recurring Stripe Price ID for Starter
-- STRIPE_PRICE_PRO: Recurring Stripe Price ID for Pro
-- STRIPE_PRICE_ENTERPRISE: Recurring Stripe Price ID for Enterprise
+Example request body:
 
-Optional:
+`{"templateId":"invoice","data":{"companyName":"Acme Corp","invoiceNumber":"INV-001","items":[{"name":"Widget","qty":2,"price":25,"total":50}],"total":50}}`
 
-- PORT: HTTP port, defaults to 3000
-- DATA_DIR: Persistent store directory, defaults to ./data
-- PUPPETEER_EXECUTABLE_PATH: Chromium executable path
-- TEST_BASE_URL: API origin used by test.js
+Send the body to `POST /api/render` with the bearer authorization header.
 
-## Railway deployment
+## Asynchronous rendering
 
-1. Create a GitHub repository named pdf-generator-api.
-2. Add every file from this build response.
-3. Push the repository to GitHub.
-4. Create a Railway project from the GitHub repository.
-5. Add a Railway volume mounted at /app/data.
-6. Set API_KEY_SALT to a securely generated random value.
-7. Set APP_URL to the public Railway service origin.
-8. Add the Stripe environment variables to enable subscriptions.
-9. Deploy the service.
-10. Configure a Stripe webhook for the public /api/webhooks/stripe endpoint.
+Paid accounts can set `async` to `true` and provide a `webhookUrl`. The API returns HTTP 202 with a job identifier. The worker sends a JSON webhook containing the generated PDF as base64.
 
-The Docker image installs Chromium and runs the application as the unprivileged node user.
+Example request body:
 
-## Register an account
-
-Request:
-
-    curl -X POST http://localhost:3000/api/auth/register -H "Content-Type: application/json" -d '{"email":"customer@example.com"}'
-
-The response contains an API key once. Store it securely.
-
-## Render a PDF from HTML
-
-    curl -X POST http://localhost:3000/api/render -H "Authorization: Bearer pdfgen_key_returned_at_registration" -H "Content-Type: application/json" -d '{"html":"<html><body><h1>Invoice</h1><p>Amount: $25.00</p></body></html>","filename":"invoice.pdf","options":{"format":"A4","printBackground":true}}' --output invoice.pdf
-
-## Create a template
-
-    curl -X POST http://localhost:3000/api/templates -H "Authorization: Bearer pdfgen_key_returned_at_registration" -H "Content-Type: application/json" -d '{"name":"Invoice","html":"<h1>Invoice {{number}}</h1><p>Customer: {{customer.name}}</p>","css":"body { font-family: Arial, sans-serif; }"}'
-
-The response includes the generated template ID.
-
-## Render a template
-
-    curl -X POST http://localhost:3000/api/render -H "Authorization: Bearer pdfgen_key_returned_at_registration" -H "Content-Type: application/json" -d '{"templateId":"template_id_returned_by_create","data":{"number":"INV-1001","customer":{"name":"Acme Corporation"}},"filename":"invoice.pdf"}' --output invoice.pdf
+`{"html":"<h1>Asynchronous document</h1>","async":true,"webhookUrl":"https://example.com/webhooks/pdf"}`
 
 ## Merge PDFs
 
-The merge endpoint accepts between 2 and 20 base64-encoded PDFs.
+Paid accounts can merge two to twenty remote PDFs synchronously through `POST /api/merge`.
 
-    curl -X POST http://localhost:3000/api/merge -H "Authorization: Bearer pdfgen_key_returned_at_registration" -H "Content-Type: application/json" -d '{"pdfs":["base64_encoded_first_pdf","base64_encoded_second_pdf"]}' --output merged.pdf
+Example request body:
 
-Each input PDF consumes one monthly operation.
+`{"urls":["https://example.com/one.pdf","https://example.com/two.pdf"]}`
 
-## Check usage
-
-    curl http://localhost:3000/api/usage -H "Authorization: Bearer pdfgen_key_returned_at_registration"
-
-## List plans
-
-    curl http://localhost:3000/api/plans
-
-Default monthly operation limits:
-
-| Plan | Operations | Watermark |
-| --- | ---: | --- |
-| Free | 100 | Yes |
-| Starter | 5,000 | No |
-| Pro | 25,000 | No |
-| Enterprise | 100,000 | No |
-
-## Start Stripe Checkout
-
-    curl -X POST http://localhost:3000/api/billing/checkout -H "Authorization: Bearer pdfgen_key_returned_at_registration" -H "Content-Type: application/json" -d '{"plan":"starter"}'
-
-The response contains checkoutUrl. The account plan changes only after a verified Stripe webhook confirms the subscription.
-
-Supported webhook events:
-
-- checkout.session.completed
-- customer.subscription.updated
-- customer.subscription.deleted
-
-## End-to-end test
-
-Start the API in one terminal:
-
-    API_KEY_SALT=development-secret npm start
-
-Run the test in another terminal:
-
-    npm test
-
-The test checks the health endpoint, registers an account, renders a PDF, and confirms usage accounting.
+Asynchronous merging is also supported by sending `mergePdfs` and `webhookUrl` to `POST /api/render`.
 
 ## API endpoints
 
-- GET /
-- GET /api/health
-- GET /api/plans
-- POST /api/auth/register
-- GET /api/account
-- GET /api/usage
-- POST /api/billing/checkout
-- GET /api/billing/success
-- GET /api/billing/cancel
-- POST /api/webhooks/stripe
-- POST /api/templates
-- GET /api/templates
-- GET /api/templates/:templateId
-- PUT /api/templates/:templateId
-- DELETE /api/templates/:templateId
-- POST /api/render
-- POST /api/merge
+- `GET /api/health` returns service health.
+- `POST /api/keys` creates a free API key.
+- `POST /api/render` renders or queues a PDF.
+- `POST /api/merge` merges remote PDFs for paid accounts.
+- `GET /api/templates` lists templates.
+- `POST /api/templates` creates a paid-account template.
+- `GET /api/usage` returns monthly usage.
+- `POST /api/billing/checkout` creates a Stripe Checkout session.
+- `POST /api/webhooks/stripe` processes Stripe events.
 
-## Storage
+## Plans
 
-Users, API-key hashes, templates, Stripe identifiers, plans, and usage counters are stored in DATA_DIR/store.json. Mount a persistent Railway volume at /app/data to retain data across deployments.
+| Plan | Monthly renders | Async jobs | Branded watermark | Custom fonts |
+| --- | ---: | --- | --- | --- |
+| Free | 100 | No | Yes | No |
+| Starter | 1,000 | Yes | No | Yes |
+| Pro | 10,000 | Yes | No | Yes |
+| Enterprise | 100,000 | Yes | No | Yes |
 
-Raw API keys are never persisted. Only HMAC-SHA256 hashes are stored.
+Stripe prices are configured with `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_PRO`, and `STRIPE_PRICE_ENTERPRISE`.
+
+## Stripe webhook
+
+Configure Stripe to send `checkout.session.completed` and `customer.subscription.deleted` events to:
+
+`https://YOUR_DOMAIN/api/webhooks/stripe`
+
+Set the signing secret as `STRIPE_WEBHOOK_SECRET`.
+
+## Railway deployment
+
+1. Push this repository to GitHub.
+2. Create a Railway project from the repository.
+3. Add a Redis service.
+4. Configure the environment variables from `.env.example`.
+5. Deploy the API using `npm start`.
+6. Create a second Railway service from the same repository and set its start command to `npm run worker`.
+7. Set the same `REDIS_URL` for both services.
+8. Configure the public API domain as `PUBLIC_URL`.
+9. Run `TEST_BASE_URL=https://YOUR_DOMAIN npm test` from a trusted environment.
+
+## Notes
+
+API keys, templates, subscription state, and usage counters are stored in memory in this compact deployment. They reset when the API process restarts. A production scale-out should move those records to Redis or a database.
+
+The `pdfa` option adds archive-oriented metadata and disables object streams. It does not claim full ISO PDF/A conformance, which requires embedded color profiles and additional validation.
 
 ## License
 
