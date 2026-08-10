@@ -1,53 +1,94 @@
-const assert = require('node:assert/strict');
+const assert = require('assert');
+const { spawn } = require('child_process');
 
-const baseUrl = process.env.TEST_BASE_URL || 'http://localhost:3000';
+const port = 3107;
+const baseUrl = `http://127.0.0.1:${port}`;
+const child = spawn(process.execPath, ['server.js'], {
+  env: {
+    ...process.env,
+    PORT: String(port),
+    BASE_URL: baseUrl,
+    DATA_DIR: `${process.cwd()}/test-data`
+  },
+  stdio: ['ignore', 'pipe', 'pipe']
+});
+
+let output = '';
+child.stdout.on('data', (data) => {
+  output += data.toString();
+});
+child.stderr.on('data', (data) => {
+  output += data.toString();
+});
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForHealth() {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      if (response.ok) return response.json();
+    } catch (error) {
+      await wait(500);
+    }
+  }
+  throw new Error(`Server did not become healthy. Output: ${output}`);
+}
 
 async function run() {
-  const healthResponse = await fetch(`${baseUrl}/api/health`);
-  assert.equal(healthResponse.status, 200);
-  const health = await healthResponse.json();
-  assert.equal(health.status, 'healthy');
+  const health = await waitForHealth();
+  assert.strictEqual(health.status, 'ok');
 
-  const keyResponse = await fetch(`${baseUrl}/api/keys`, {
+  const signupResponse = await fetch(`${baseUrl}/api/signup`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}'
+    body: JSON.stringify({
+      email: `test-${Date.now()}@example.com`
+    })
   });
-  assert.equal(keyResponse.status, 201);
-  const keyResult = await keyResponse.json();
-  assert.match(keyResult.apiKey, /^pdfgen_free_/);
+  assert.strictEqual(signupResponse.status, 201);
+  const signup = await signupResponse.json();
+  assert.ok(signup.apiKey.startsWith('pdf_'));
 
   const usageResponse = await fetch(`${baseUrl}/api/usage`, {
-    headers: {
-      Authorization: `Bearer ${keyResult.apiKey}`
-    }
+    headers: { 'X-API-Key': signup.apiKey }
   });
-  assert.equal(usageResponse.status, 200);
+  assert.strictEqual(usageResponse.status, 200);
   const usage = await usageResponse.json();
-  assert.equal(usage.tier, 'free');
-  assert.equal(usage.used, 0);
+  assert.strictEqual(usage.plan, 'free');
+  assert.strictEqual(usage.used, 0);
 
   const renderResponse = await fetch(`${baseUrl}/api/render`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${keyResult.apiKey}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'X-API-Key': signup.apiKey
     },
     body: JSON.stringify({
-      html: '<h1>PdfGenerator API test</h1>',
-      css: 'h1{color:#2457ff}',
-      options: { format: 'A4' }
+      html: '<html><body><h1>Hello {{name}}</h1></body></html>',
+      data: { name: 'API Test' }
     })
   });
-  assert.equal(renderResponse.status, 200);
-  assert.equal(renderResponse.headers.get('content-type'), 'application/pdf');
+  assert.strictEqual(renderResponse.status, 200);
+  assert.ok(
+    String(renderResponse.headers.get('content-type')).includes('application/pdf')
+  );
   const pdf = Buffer.from(await renderResponse.arrayBuffer());
-  assert.equal(pdf.subarray(0, 4).toString(), '%PDF');
+  assert.ok(pdf.subarray(0, 4).toString() === '%PDF');
+  assert.ok(pdf.length > 500);
 
-  console.log('Health, authentication, usage, and PDF rendering tests passed');
+  console.log('Health, signup, usage, authentication, and PDF rendering tests passed.');
 }
 
-run().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+run()
+  .then(() => {
+    child.kill('SIGTERM');
+  })
+  .catch((error) => {
+    console.error(error);
+    console.error(output);
+    child.kill('SIGTERM');
+    process.exitCode = 1;
+  });
