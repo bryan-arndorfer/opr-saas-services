@@ -1,12 +1,11 @@
 node_modules/
 .env
-.env.*
-!.env.example
-data/*
-!data/.gitkeep
-test-data/
+.env.local
 *.log
-*.pdf
+npm-debug.log*
 .DS_Store
 coverage/
 .nyc_output/
+*.pdf
+temp/
+*.tmp
