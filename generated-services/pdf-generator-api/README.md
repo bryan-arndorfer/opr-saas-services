@@ -1,224 +1,265 @@
 # PdfGenerator API
 
-Production-ready HTML-to-PDF conversion API with template support, async batch processing, PDF merging, and Stripe-powered monetization.
+PdfGenerator API converts HTML into downloadable PDF files using Puppeteer. It supports reusable templates, escaped template variables, raw HTML variables, watermarks, custom headers and footers, page numbers, synchronous rendering, asynchronous batch jobs, monthly usage limits, and Stripe subscription checkout.
 
-## Features
+## Requirements
 
-- **HTML/CSS to PDF**: Submit raw HTML or use saved templates with JSON data
-- **Templates**: Store reusable templates with `{{variable}}` placeholders
-- **Header/Footer**: Custom header/footer templates with page numbering
-- **Watermarks**: Automatic watermarking on free tier
-- **PDF Merging**: Combine multiple PDFs into one
-- **Async Batch Processing**: Process up to 100 PDFs with webhook callbacks
-- **Custom Fonts**: Upload and use custom web fonts (paid tiers)
-- **PDF/A Compliance**: Generate archival-quality PDF/A documents
-- **API Key Auth**: Simple Bearer token authentication
-- **Rate Limiting**: Per-tier monthly render limits
-- **Stripe Billing**: Subscription management via Stripe Checkout & Portal
+- Node.js 18 or newer
+- npm
+- A Stripe account for paid subscriptions
+- A Railway account for hosted deployment
 
-## Quick Start
+## Installation
 
-### Local Development
+Clone the repository and install dependencies:
 
-```bash
-npm install
-cp .env.example .env  # Configure your keys
-npm start
-```
+    git clone https://github.com/your-account/pdf-generator-api.git
+    cd pdf-generator-api
+    npm install
 
-### Deploy to Railway
+Start the API:
 
-1. Push this repo to GitHub
-2. Connect to Railway
-3. Add environment variables (see below)
-4. Deploy
+    npm start
 
-## Environment Variables
+The service listens on port 3000 by default.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `PORT` | No | Server port (default: 3000) |
-| `API_KEY` | Yes | Master API key for admin access |
-| `STRIPE_SECRET_KEY` | No | Stripe secret key for paid tiers |
-| `STRIPE_WEBHOOK_SECRET` | No | Stripe webhook signing secret |
-| `STRIPE_PRICE_STARTER` | No | Stripe Price ID for Starter tier |
-| `STRIPE_PRICE_PRO` | No | Stripe Price ID for Pro tier |
-| `STRIPE_PRICE_ENTERPRISE` | No | Stripe Price ID for Enterprise tier |
-| `NODE_ENV` | No | `production` or `development` |
+Check its health:
 
-## API Endpoints
+    curl http://localhost:3000/api/health
 
-### Health
-```
-GET /api/health
-```
+## Environment variables
 
-### Authentication
-All endpoints (except `/api/health` and `/api/webhooks/stripe`) require:
-```
-Authorization: Bearer <your_api_key>
-```
+The API runs locally without Stripe using the built-in development key `demo-key`.
 
-### API Keys
-```
-POST /api/keys           # Create new API key (tier: free|starter|pro|enterprise)
-GET  /api/usage          # Check current usage and limits
-```
+Supported environment variables:
 
-### PDF Rendering
-```
-POST /api/render
-```
-**Body:**
-```json
-{
-  "html": "<h1>Hello {{name}}</h1>",
-  "templateId": "optional-template-id",
-  "data": { "name": "World" },
-  "options": {
-    "format": "A4",
-    "margin": { "top": "20mm", "bottom": "20mm" },
-    "headerTemplate": "<div>My Header</div>",
-    "footerTemplate": "<div>Page <span class='pageNumber'></span></div>",
-    "pageNumbers": true,
-    "watermarkText": "Custom watermark",
-    "customFonts": [{ "family": "MyFont", "url": "https://...", "format": "woff2" }],
-    "pdfA": false
-  }
-}
-```
-**Response:** Binary PDF (`application/pdf`)
+- `PORT`: HTTP server port. Railway supplies this automatically.
+- `PUBLIC_URL`: Public HTTPS origin used for Stripe success and cancellation URLs.
+- `API_KEYS`: Comma-separated free-tier API keys. Defaults to `demo-key`.
+- `PREMIUM_API_KEYS`: Comma-separated paid API keys that bypass the free render limit.
+- `MAX_FREE_RENDERS_PER_MONTH`: Monthly render limit for free keys. Defaults to `100`.
+- `MAX_BATCH_SIZE`: Maximum documents per batch. Defaults to `20`.
+- `MAX_HTML_LENGTH`: Maximum HTML characters per document. Defaults to `2000000`.
+- `STRIPE_SECRET_KEY`: Stripe secret API key.
+- `STRIPE_WEBHOOK_SECRET`: Signing secret for the Stripe webhook endpoint.
+- `STRIPE_STARTER_PRICE_ID`: Recurring Stripe Price ID for the starter plan.
+- `STRIPE_PRO_PRICE_ID`: Recurring Stripe Price ID for the pro plan.
+- `STRIPE_BUSINESS_PRICE_ID`: Recurring Stripe Price ID for the business plan.
+- `NODE_ENV`: Set to `production` in production.
 
-### Templates
-```
-POST   /api/templates          # Create template { name, html, description }
-GET    /api/templates          # List your templates
-GET    /api/templates/:id      # Get template
-DELETE /api/templates/:id      # Delete template
-```
+A local configuration can be supplied through a `.env` file:
 
-### Batch Processing (Paid Tiers)
-```
-POST /api/batch
-```
-**Body:**
-```json
-{
-  "items": [
-    { "html": "<h1>Doc 1</h1>" },
-    { "templateId": "tpl_123", "data": { "name": "Doc 2" } }
-  ],
-  "webhookUrl": "https://your-app.com/webhook",
-  "options": { "format": "A4" }
-}
-```
-**Response:** `{ "jobId": "...", "status": "pending", "statusUrl": "/api/batch/..." }`
+    PORT=3000
+    PUBLIC_URL=http://localhost:3000
+    API_KEYS=demo-key
+    PREMIUM_API_KEYS=
+    MAX_FREE_RENDERS_PER_MONTH=100
+    MAX_BATCH_SIZE=20
+    MAX_HTML_LENGTH=2000000
+    NODE_ENV=development
 
-```
-GET /api/batch/:jobId  # Check job status and results
-```
+Stripe variables can remain unset when testing PDF generation locally.
 
-### PDF Merging
-```
-POST /api/merge
-Content-Type: multipart/form-data
-```
-Upload 2+ PDF files as `pdfs` field. Returns merged PDF.
+## Authentication
 
-### Billing (Stripe)
-```
-POST /api/billing/checkout   # Create checkout session { priceId, customerId? }
-POST /api/billing/portal     # Create billing portal session
-POST /api/webhooks/stripe    # Stripe webhook endpoint
-```
+All rendering, template, usage, batch, and job endpoints require an API key.
 
-## Tier Limits
+Use the `x-api-key` header:
 
-| Feature | Free | Starter | Pro | Enterprise |
-|---------|------|---------|-----|------------|
-| Monthly Renders | 100 | 1,000 | 10,000 | 100,000 |
-| Async Batch | ❌ | ✅ | ✅ | ✅ |
-| Watermark | ✅ | ❌ | ❌ | ❌ |
-| Custom Fonts | ❌ | ❌ | ✅ | ✅ |
-| Priority Rendering | ❌ | ❌ | ✅ | ✅ |
-| Dedicated Workers | ❌ | ❌ | ❌ | ✅ |
+    x-api-key: demo-key
 
-## Example Usage
+Or use a bearer token:
 
-### cURL - Simple Render
-```bash
-curl -X POST http://localhost:3000/api/render \
-  -H "Authorization: Bearer pdfgen_abc123" \
-  -H "Content-Type: application/json" \
-  -d '{"html": "<h1>Hello PDF</h1><p>Generated at {{time}}</p>", "data": {"time": "2024-01-15"}}' \
-  --output output.pdf
-```
+    Authorization: Bearer demo-key
 
-### cURL - With Template
-```bash
-# Create template
-curl -X POST http://localhost:3000/api/templates \
-  -H "Authorization: Bearer pdfgen_abc123" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "invoice", "html": "<h1>Invoice {{number}}</h1><p>Amount: {{amount}}</p>"}'
+The health, pricing, documentation, checkout, checkout activation, and Stripe webhook endpoints do not require an API key.
 
-# Use template
-curl -X POST http://localhost:3000/api/render \
-  -H "Authorization: Bearer pdfgen_abc123" \
-  -H "Content-Type: application/json" \
-  -d '{"templateId": "returned-template-id", "data": {"number": "INV-001", "amount": "$1,234.56"}}' \
-  --output invoice.pdf
-```
+## Render a PDF
 
-### JavaScript/Node.js
-```javascript
-const axios = require('axios');
-const fs = require('fs');
+Send HTML in a JSON request and save the binary response:
 
-const API_KEY = 'pdfgen_abc123';
-const BASE_URL = 'https://your-api.railway.app';
+    curl -X POST http://localhost:3000/api/render \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: demo-key" \
+      -d '{"html":"<!doctype html><html><body><h1>Invoice</h1><p>Paid in full.</p></body></html>","filename":"invoice"}' \
+      --output invoice.pdf
 
-async function generatePdf(html, options = {}) {
-  const response = await axios.post(`${BASE_URL}/api/render`, { html, options }, {
-    headers: { Authorization: `Bearer ${API_KEY}` },
-    responseType: 'arraybuffer'
-  });
-  fs.writeFileSync('output.pdf', response.data);
-}
+## PDF options
 
-generatePdf('<h1>Hello from Node!</h1>');
-```
+The `options` object supports:
 
-## Webhook Payload (Batch Completion)
-```json
-{
-  "jobId": "batch_abc123",
-  "status": "completed",
-  "results": [
-    { "index": 0, "pdfBase64": "JVBERi0xLjQK...", "size": 45231 },
-    { "index": 1, "error": "Template not found" }
-  ],
-  "completedAt": "2024-01-15T10:30:00.000Z"
-}
-```
+- `format`: Paper format such as `A4`, `Letter`, or `Legal`.
+- `landscape`: Enables landscape orientation.
+- `printBackground`: Prints CSS backgrounds. Enabled by default.
+- `preferCSSPageSize`: Uses CSS `@page` dimensions when available.
+- `scale`: PDF rendering scale between `0.1` and `2`.
+- `margin`: Object containing `top`, `right`, `bottom`, and `left`.
+- `watermark`: Text displayed diagonally over every page.
+- `headerTemplate`: Puppeteer-compatible HTML header template.
+- `footerTemplate`: Puppeteer-compatible HTML footer template.
+- `pageNumbers`: Adds current and total page numbers.
+- `waitForMilliseconds`: Waits up to 5000 milliseconds before PDF capture.
 
-## Architecture
+Example:
 
-- **Express.js** - HTTP server
-- **Puppeteer** - Headless Chrome for PDF generation
-- **pdf-lib** - PDF merging/manipulation
-- **Stripe** - Subscriptions & billing portal
-- **In-memory storage** - API keys, templates, usage, jobs (swap for Redis/Postgres in production)
+    curl -X POST http://localhost:3000/api/render \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: demo-key" \
+      -d '{"html":"<html><body><h1>Quarterly Report</h1><p>Confidential financial results.</p></body></html>","filename":"report","options":{"format":"A4","watermark":"CONFIDENTIAL","pageNumbers":true,"margin":{"top":"20mm","right":"15mm","bottom":"25mm","left":"15mm"}}}' \
+      --output report.pdf
 
-## Scaling Notes
+## Templates
 
-For production workloads:
-1. Replace in-memory stores with Redis (rate limits, jobs) + PostgreSQL (templates, keys, usage)
-2. Run multiple Puppeteer workers via browser pool
-3. Use object storage (S3) for async batch results
-4. Add request queuing (BullMQ) for batch jobs
-5. Enable horizontal scaling on Railway
+Create a reusable template:
 
-## License
+    curl -X POST http://localhost:3000/api/templates \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: demo-key" \
+      -d '{"name":"Invoice","html":"<html><body><h1>Invoice {{invoice.number}}</h1><p>Customer: {{customer.name}}</p><div>{{{lineItemsHtml}}}</div></body></html>"}'
 
-MIT
+Double braces escape HTML. Triple braces insert trusted raw HTML.
+
+Render a saved template by using the returned template ID:
+
+    curl -X POST http://localhost:3000/api/render \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: demo-key" \
+      -d '{"templateId":"9f32b018-9539-4a44-b3ad-c771c48ac325","data":{"invoice":{"number":"INV-1001"},"customer":{"name":"Acme Company"},"lineItemsHtml":"<ul><li>API subscription</li></ul>"},"filename":"invoice-1001"}' \
+      --output invoice-1001.pdf
+
+List templates:
+
+    curl http://localhost:3000/api/templates \
+      -H "x-api-key: demo-key"
+
+Delete a template:
+
+    curl -X DELETE http://localhost:3000/api/templates/9f32b018-9539-4a44-b3ad-c771c48ac325 \
+      -H "x-api-key: demo-key"
+
+## Asynchronous batches
+
+Create a batch:
+
+    curl -X POST http://localhost:3000/api/batches \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: demo-key" \
+      -d '{"documents":[{"html":"<html><body><h1>Document One</h1></body></html>"},{"html":"<html><body><h1>Document Two</h1></body></html>","options":{"pageNumbers":true}}]}'
+
+The response contains a job ID and document IDs.
+
+Check job status:
+
+    curl http://localhost:3000/api/jobs/9b14db1f-e4c4-420c-a675-f67721179737 \
+      -H "x-api-key: demo-key"
+
+Download a completed batch document:
+
+    curl http://localhost:3000/api/jobs/9b14db1f-e4c4-420c-a675-f67721179737/documents/a6aec078-f760-4a24-97d7-596aab215230/pdf \
+      -H "x-api-key: demo-key" \
+      --output batch-document.pdf
+
+## Usage
+
+View current monthly usage:
+
+    curl http://localhost:3000/api/usage \
+      -H "x-api-key: demo-key"
+
+Free keys receive the configured monthly allowance. Premium keys bypass the application-level free-tier limit.
+
+## Stripe subscriptions
+
+Create three recurring Stripe products and prices for the starter, pro, and business plans. Assign their Price IDs to the corresponding Railway environment variables.
+
+Create a subscription checkout session:
+
+    curl -X POST http://localhost:3000/api/billing/checkout \
+      -H "Content-Type: application/json" \
+      -d '{"plan":"starter"}'
+
+The response includes a Stripe Checkout URL. After successful payment, Stripe redirects the customer to `/billing/success`, where the paid API key is displayed.
+
+A checkout session can also be activated programmatically:
+
+    curl -X POST http://localhost:3000/api/billing/activate \
+      -H "Content-Type: application/json" \
+      -d '{"sessionId":"cs_test_a1M8wZjZVbdQhHpGfQjDjfGH6mKJxZ3W8pQ9nR2sT4uV5wX6yZ7"}'
+
+Configure the Stripe webhook destination as:
+
+    https://pdf-generator-api-production.up.railway.app/api/billing/webhook
+
+Subscribe it to these events:
+
+- `checkout.session.completed`
+- `customer.subscription.deleted`
+- `customer.subscription.paused`
+
+The Stripe signing secret must be stored in `STRIPE_WEBHOOK_SECRET`.
+
+## Railway deployment
+
+Create a GitHub repository named `pdf-generator-api` and commit these files.
+
+Create a Railway project from the GitHub repository. Railway detects `package.json`, installs Node.js dependencies with Nixpacks, starts the service with `npm start`, and checks `/api/health`.
+
+Set these Railway variables:
+
+    NODE_ENV=production
+    PUBLIC_URL=https://pdf-generator-api-production.up.railway.app
+    API_KEYS=demo-key
+    MAX_FREE_RENDERS_PER_MONTH=100
+    MAX_BATCH_SIZE=20
+    MAX_HTML_LENGTH=2000000
+
+Add the Stripe variables when billing is enabled.
+
+Generate a Railway public domain and update `PUBLIC_URL` to that exact HTTPS origin. Redeploy after changing environment variables.
+
+## Health check
+
+The health endpoint does not launch Chromium, so Railway can verify the web process quickly:
+
+    GET /api/health
+
+Example response:
+
+    {
+      "status": "ok",
+      "service": "pdf-generator-api",
+      "timestamp": "2026-08-10T12:00:00.000Z",
+      "stripeConfigured": false,
+      "uptimeSeconds": 42
+    }
+
+## Testing
+
+Validate the server syntax:
+
+    npm test
+
+Run the service and test the complete free-tier flow:
+
+    npm start
+
+In a second terminal:
+
+    curl http://localhost:3000/api/health
+
+    curl http://localhost:3000/api/usage \
+      -H "x-api-key: demo-key"
+
+    curl -X POST http://localhost:3000/api/render \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: demo-key" \
+      -d '{"html":"<html><body><h1>End-to-end test</h1><p>The PDF service is working.</p></body></html>","options":{"pageNumbers":true}}' \
+      --output end-to-end-test.pdf
+
+A successful render returns HTTP 200 with `Content-Type: application/pdf`.
+
+## Operational behavior
+
+Templates, usage counters, dynamically activated premium keys, batch jobs, and generated batch PDFs are stored in process memory. Configured API keys and premium API keys are loaded from environment variables at startup. A paid key can be restored after a restart by calling the checkout activation endpoint again with its paid Stripe Checkout session ID.
+
+Chromium is launched lazily on the first render. The process reuses one browser instance and opens a separate page for each PDF. SIGTERM and SIGINT close Chromium before process exit.
