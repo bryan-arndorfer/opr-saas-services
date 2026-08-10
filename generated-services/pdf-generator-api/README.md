@@ -1,162 +1,224 @@
-# PDF Generator API
+# PdfGenerator API
 
-PDF Generator API is a self-service HTML-to-PDF micro-SaaS built with Node.js, Express, Puppeteer, PDF-Lib, Redis, and Stripe.
+Production-ready HTML-to-PDF conversion API with template support, async batch processing, PDF merging, and Stripe-powered monetization.
 
 ## Features
 
-- HTML-to-PDF rendering
-- Reusable account-scoped templates
-- Safe variable interpolation with nested values
-- A4, Letter, Legal, A-series, landscape, margins, headers, and footers
-- Automatic free-tier watermarks
-- Base64 PDF merging
-- API key creation and revocation
-- Monthly usage quotas
-- Optional Redis-backed usage counters
-- Stripe subscription checkout and billing portal
-- Signed Stripe webhook processing
-- Temporary download URLs
-- Railway health checks
-- End-to-end API and PDF tests
+- **HTML/CSS to PDF**: Submit raw HTML or use saved templates with JSON data
+- **Templates**: Store reusable templates with `{{variable}}` placeholders
+- **Header/Footer**: Custom header/footer templates with page numbering
+- **Watermarks**: Automatic watermarking on free tier
+- **PDF Merging**: Combine multiple PDFs into one
+- **Async Batch Processing**: Process up to 100 PDFs with webhook callbacks
+- **Custom Fonts**: Upload and use custom web fonts (paid tiers)
+- **PDF/A Compliance**: Generate archival-quality PDF/A documents
+- **API Key Auth**: Simple Bearer token authentication
+- **Rate Limiting**: Per-tier monthly render limits
+- **Stripe Billing**: Subscription management via Stripe Checkout & Portal
 
-## Plans
+## Quick Start
 
-Free includes 100 monthly renders, 3 templates, and watermarked output.
+### Local Development
 
-Starter includes 2,000 monthly renders, 50 templates, and unwatermarked output.
+```bash
+npm install
+cp .env.example .env  # Configure your keys
+npm start
+```
 
-Pro includes 15,000 monthly renders, 500 templates, and unwatermarked output.
+### Deploy to Railway
 
-Stripe prices are configured through STRIPE_PRICE_STARTER and STRIPE_PRICE_PRO.
+1. Push this repo to GitHub
+2. Connect to Railway
+3. Add environment variables (see below)
+4. Deploy
 
-## Local setup
+## Environment Variables
 
-Requirements:
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PORT` | No | Server port (default: 3000) |
+| `API_KEY` | Yes | Master API key for admin access |
+| `STRIPE_SECRET_KEY` | No | Stripe secret key for paid tiers |
+| `STRIPE_WEBHOOK_SECRET` | No | Stripe webhook signing secret |
+| `STRIPE_PRICE_STARTER` | No | Stripe Price ID for Starter tier |
+| `STRIPE_PRICE_PRO` | No | Stripe Price ID for Pro tier |
+| `STRIPE_PRICE_ENTERPRISE` | No | Stripe Price ID for Enterprise tier |
+| `NODE_ENV` | No | `production` or `development` |
 
-- Node.js 20 or newer
-- A platform supported by Puppeteer
+## API Endpoints
 
-Install dependencies:
+### Health
+```
+GET /api/health
+```
 
-    npm install
+### Authentication
+All endpoints (except `/api/health` and `/api/webhooks/stripe`) require:
+```
+Authorization: Bearer <your_api_key>
+```
 
-Copy environment configuration:
+### API Keys
+```
+POST /api/keys           # Create new API key (tier: free|starter|pro|enterprise)
+GET  /api/usage          # Check current usage and limits
+```
 
-    cp .env.example .env
+### PDF Rendering
+```
+POST /api/render
+```
+**Body:**
+```json
+{
+  "html": "<h1>Hello {{name}}</h1>",
+  "templateId": "optional-template-id",
+  "data": { "name": "World" },
+  "options": {
+    "format": "A4",
+    "margin": { "top": "20mm", "bottom": "20mm" },
+    "headerTemplate": "<div>My Header</div>",
+    "footerTemplate": "<div>Page <span class='pageNumber'></span></div>",
+    "pageNumbers": true,
+    "watermarkText": "Custom watermark",
+    "customFonts": [{ "family": "MyFont", "url": "https://...", "format": "woff2" }],
+    "pdfA": false
+  }
+}
+```
+**Response:** Binary PDF (`application/pdf`)
 
-Start the API:
+### Templates
+```
+POST   /api/templates          # Create template { name, html, description }
+GET    /api/templates          # List your templates
+GET    /api/templates/:id      # Get template
+DELETE /api/templates/:id      # Delete template
+```
 
-    npm start
+### Batch Processing (Paid Tiers)
+```
+POST /api/batch
+```
+**Body:**
+```json
+{
+  "items": [
+    { "html": "<h1>Doc 1</h1>" },
+    { "templateId": "tpl_123", "data": { "name": "Doc 2" } }
+  ],
+  "webhookUrl": "https://your-app.com/webhook",
+  "options": { "format": "A4" }
+}
+```
+**Response:** `{ "jobId": "...", "status": "pending", "statusUrl": "/api/batch/..." }`
 
-Run the end-to-end test:
+```
+GET /api/batch/:jobId  # Check job status and results
+```
 
-    npm test
+### PDF Merging
+```
+POST /api/merge
+Content-Type: multipart/form-data
+```
+Upload 2+ PDF files as `pdfs` field. Returns merged PDF.
 
-The health endpoint is available at:
+### Billing (Stripe)
+```
+POST /api/billing/checkout   # Create checkout session { priceId, customerId? }
+POST /api/billing/portal     # Create billing portal session
+POST /api/webhooks/stripe    # Stripe webhook endpoint
+```
 
-    http://localhost:3000/api/health
+## Tier Limits
 
-## Create an account
+| Feature | Free | Starter | Pro | Enterprise |
+|---------|------|---------|-----|------------|
+| Monthly Renders | 100 | 1,000 | 10,000 | 100,000 |
+| Async Batch | ❌ | ✅ | ✅ | ✅ |
+| Watermark | ✅ | ❌ | ❌ | ❌ |
+| Custom Fonts | ❌ | ❌ | ✅ | ✅ |
+| Priority Rendering | ❌ | ❌ | ✅ | ✅ |
+| Dedicated Workers | ❌ | ❌ | ❌ | ✅ |
 
-Request:
+## Example Usage
 
-    curl -X POST http://localhost:3000/api/signup -H "Content-Type: application/json" -d '{"email":"owner@example.com"}'
+### cURL - Simple Render
+```bash
+curl -X POST http://localhost:3000/api/render \
+  -H "Authorization: Bearer pdfgen_abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"html": "<h1>Hello PDF</h1><p>Generated at {{time}}</p>", "data": {"time": "2024-01-15"}}' \
+  --output output.pdf
+```
 
-The response contains the account and its first API key. The full key is only returned when it is created.
+### cURL - With Template
+```bash
+# Create template
+curl -X POST http://localhost:3000/api/templates \
+  -H "Authorization: Bearer pdfgen_abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "invoice", "html": "<h1>Invoice {{number}}</h1><p>Amount: {{amount}}</p>"}'
 
-## Render a PDF
+# Use template
+curl -X POST http://localhost:3000/api/render \
+  -H "Authorization: Bearer pdfgen_abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"templateId": "returned-template-id", "data": {"number": "INV-001", "amount": "$1,234.56"}}' \
+  --output invoice.pdf
+```
 
-    curl -X POST http://localhost:3000/api/render -H "Content-Type: application/json" -H "X-API-Key: pdf_your_key" -d '{"html":"<html><body><h1>Hello {{customer.name}}</h1></body></html>","data":{"customer":{"name":"Acme"}},"options":{"format":"A4","pageNumbers":true}}' --output document.pdf
+### JavaScript/Node.js
+```javascript
+const axios = require('axios');
+const fs = require('fs');
 
-Set options.return to url to receive a temporary download URL instead of binary PDF data.
+const API_KEY = 'pdfgen_abc123';
+const BASE_URL = 'https://your-api.railway.app';
 
-## Templates
+async function generatePdf(html, options = {}) {
+  const response = await axios.post(`${BASE_URL}/api/render`, { html, options }, {
+    headers: { Authorization: `Bearer ${API_KEY}` },
+    responseType: 'arraybuffer'
+  });
+  fs.writeFileSync('output.pdf', response.data);
+}
 
-Create a template:
+generatePdf('<h1>Hello from Node!</h1>');
+```
 
-    curl -X POST http://localhost:3000/api/templates -H "Content-Type: application/json" -H "X-API-Key: pdf_your_key" -d '{"name":"Invoice","html":"<html><body><h1>Invoice {{number}}</h1><p>Total: {{total}}</p></body></html>"}'
+## Webhook Payload (Batch Completion)
+```json
+{
+  "jobId": "batch_abc123",
+  "status": "completed",
+  "results": [
+    { "index": 0, "pdfBase64": "JVBERi0xLjQK...", "size": 45231 },
+    { "index": 1, "error": "Template not found" }
+  ],
+  "completedAt": "2024-01-15T10:30:00.000Z"
+}
+```
 
-Render it by passing templateId and data to POST /api/render.
+## Architecture
 
-## Merge PDFs
+- **Express.js** - HTTP server
+- **Puppeteer** - Headless Chrome for PDF generation
+- **pdf-lib** - PDF merging/manipulation
+- **Stripe** - Subscriptions & billing portal
+- **In-memory storage** - API keys, templates, usage, jobs (swap for Redis/Postgres in production)
 
-POST /api/merge with a JSON body containing files, an array of at least two base64-encoded PDF strings. A merge consumes one monthly render.
+## Scaling Notes
 
-## API endpoints
+For production workloads:
+1. Replace in-memory stores with Redis (rate limits, jobs) + PostgreSQL (templates, keys, usage)
+2. Run multiple Puppeteer workers via browser pool
+3. Use object storage (S3) for async batch results
+4. Add request queuing (BullMQ) for batch jobs
+5. Enable horizontal scaling on Railway
 
-- GET /api/health
-- POST /api/signup
-- GET /api/account
-- POST /api/keys
-- GET /api/keys
-- DELETE /api/keys/:key
-- POST /api/templates
-- GET /api/templates
-- GET /api/templates/:id
-- DELETE /api/templates/:id
-- POST /api/render
-- POST /api/merge
-- GET /api/files/:filename
-- GET /api/usage
-- POST /api/billing/checkout
-- POST /api/billing/portal
-- POST /api/webhooks/stripe
+## License
 
-Authenticated endpoints require the X-API-Key header.
-
-## Stripe setup
-
-Create recurring Starter and Pro prices in Stripe and assign their IDs to STRIPE_PRICE_STARTER and STRIPE_PRICE_PRO.
-
-Set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET.
-
-Configure the Stripe webhook endpoint as:
-
-    https://your-domain.example/api/webhooks/stripe
-
-Subscribe it to:
-
-- checkout.session.completed
-- customer.subscription.updated
-- customer.subscription.deleted
-
-Create a checkout session:
-
-    curl -X POST https://your-domain.example/api/billing/checkout -H "Content-Type: application/json" -H "X-API-Key: pdf_your_key" -d '{"plan":"starter"}'
-
-The API determines the active plan from the subscription's Stripe price rather than trusting client metadata.
-
-## Railway deployment
-
-1. Push the repository to GitHub.
-2. Create a Railway project from the GitHub repository.
-3. Add a persistent volume mounted at /data.
-4. Set DATA_DIR to /data.
-5. Set BASE_URL to the public Railway domain.
-6. Add a Railway Redis service and set REDIS_URL.
-7. Add the Stripe environment variables.
-8. Deploy the service.
-9. Confirm that GET /api/health returns status ok.
-10. Run npm test locally before promoting changes.
-
-The railway.json file installs production dependencies, starts the server, and configures the health check.
-
-## Storage
-
-Account, key, template, and Stripe customer state is stored in DATA_DIR/state.json. Mount DATA_DIR on a Railway persistent volume in production.
-
-Generated URL-returned PDFs are stored under DATA_DIR/files and expire after 24 hours.
-
-Redis is optional. When configured, it stores monthly usage counters. Without Redis, counters are persisted in state.json.
-
-## Security behavior
-
-- API keys use 192 bits of cryptographically secure random data.
-- Stripe webhook signatures are verified against the raw request body.
-- Template variables are HTML escaped.
-- JavaScript is disabled during rendering unless options.allowJavaScript is explicitly true.
-- Request bodies are limited to 12 MB.
-- HTML and templates are limited to 5 MB.
-- Download filenames are strictly validated.
-- Chromium runs with Railway-compatible sandbox flags.
-- Account data is isolated by API key ownership.
+MIT
