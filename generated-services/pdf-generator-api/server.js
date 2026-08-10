@@ -1,248 +1,196 @@
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+require('dotenv').config();
+
 const express = require('express');
-const cors = require('cors');
 const helmet = require('helmet');
+const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const puppeteer = require('puppeteer');
-const { PDFDocument } = require('pdf-lib');
-const Stripe = require('stripe');
+const { Validator } = require('jsonschema');
 const { v4: uuidv4 } = require('uuid');
+const puppeteer = require('puppeteer');
+const { PDFDocument, rgb, degrees, StandardFonts } = require('pdf-lib');
+const Stripe = require('stripe');
+const { Queue } = require('bullmq');
+const Redis = require('ioredis');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
-const appUrl = process.env.APP_URL || `http://localhost:${port}`;
-const apiKeySalt = process.env.API_KEY_SALT || 'local-development-salt';
-const dataDirectory = process.env.DATA_DIR || path.join(__dirname, 'data');
-const storePath = path.join(dataDirectory, 'store.json');
 const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
   : null;
 
-const plans = {
+const tierLimits = {
   free: {
-    id: 'free',
-    name: 'Free',
-    monthlyOperations: 100,
+    monthlyRenders: 100,
+    async: false,
     watermark: true,
-    priceId: null
+    customFonts: false
   },
   starter: {
-    id: 'starter',
-    name: 'Starter',
-    monthlyOperations: 5000,
+    monthlyRenders: 1000,
+    async: true,
     watermark: false,
-    priceId: process.env.STRIPE_PRICE_STARTER || null
+    customFonts: true
   },
   pro: {
-    id: 'pro',
-    name: 'Pro',
-    monthlyOperations: 25000,
+    monthlyRenders: 10000,
+    async: true,
     watermark: false,
-    priceId: process.env.STRIPE_PRICE_PRO || null
+    customFonts: true
   },
   enterprise: {
-    id: 'enterprise',
-    name: 'Enterprise',
-    monthlyOperations: 100000,
+    monthlyRenders: 100000,
+    async: true,
     watermark: false,
-    priceId: process.env.STRIPE_PRICE_ENTERPRISE || null
+    customFonts: true
   }
 };
 
-fs.mkdirSync(dataDirectory, { recursive: true });
+const apiKeys = new Map();
+const usageTracker = new Map();
+const templates = new Map();
+let browser = null;
+let redis = null;
+let renderQueue = null;
+let mergeQueue = null;
 
-function emptyStore() {
-  return {
-    users: {},
-    templates: {},
-    usage: {}
-  };
+if (process.env.REDIS_URL) {
+  redis = new Redis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false
+  });
+  renderQueue = new Queue('pdf-render', { connection: redis });
+  mergeQueue = new Queue('pdf-merge', { connection: redis });
 }
 
-function loadStore() {
-  if (!fs.existsSync(storePath)) {
-    return emptyStore();
-  }
+templates.set('invoice', {
+  html: '<main><header><h1>{{companyName}}</h1><p>Invoice #{{invoiceNumber}}</p></header><table><thead><tr><th>Item</th><th>Quantity</th><th>Price</th><th>Total</th></tr></thead><tbody>{{items}}</tbody></table><p class="total">Total: ${{total}}</p></main>',
+  css: 'body{font-family:Arial,sans-serif;margin:40px;color:#172033}header{text-align:center;margin-bottom:30px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #d8deea;padding:9px;text-align:left}th{background:#f4f7fb}.total{text-align:right;font-size:20px;font-weight:700}'
+});
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-    return {
-      users: parsed.users || {},
-      templates: parsed.templates || {},
-      usage: parsed.usage || {}
-    };
-  } catch (error) {
-    console.error('Unable to read persistent store:', error.message);
-    return emptyStore();
-  }
-}
+const validator = new Validator();
+const renderSchema = {
+  type: 'object',
+  properties: {
+    html: { type: 'string', minLength: 1 },
+    css: { type: 'string' },
+    templateId: { type: 'string', minLength: 1 },
+    data: { type: 'object' },
+    options: {
+      type: 'object',
+      properties: {
+        format: {
+          type: 'string',
+          enum: ['A4', 'Letter', 'Legal', 'Tabloid']
+        },
+        margin: {
+          type: 'object',
+          properties: {
+            top: { type: 'string' },
+            right: { type: 'string' },
+            bottom: { type: 'string' },
+            left: { type: 'string' }
+          },
+          additionalProperties: false
+        },
+        headerTemplate: { type: 'string' },
+        footerTemplate: { type: 'string' },
+        displayHeaderFooter: { type: 'boolean' },
+        printBackground: { type: 'boolean' },
+        landscape: { type: 'boolean' },
+        pageRanges: { type: 'string' },
+        watermark: { type: 'string' },
+        pdfa: { type: 'boolean' },
+        customFonts: {
+          type: 'array',
+          maxItems: 10,
+          items: { type: 'string', format: 'uri' }
+        }
+      },
+      additionalProperties: false
+    },
+    async: { type: 'boolean' },
+    webhookUrl: { type: 'string', format: 'uri' },
+    mergePdfs: {
+      type: 'array',
+      minItems: 2,
+      maxItems: 20,
+      items: { type: 'string', format: 'uri' }
+    }
+  },
+  additionalProperties: false,
+  oneOf: [
+    { required: ['html'] },
+    { required: ['templateId', 'data'] },
+    { required: ['mergePdfs'] }
+  ]
+};
 
-let store = loadStore();
-
-function saveStore() {
-  const temporaryPath = `${storePath}.tmp`;
-  fs.writeFileSync(temporaryPath, JSON.stringify(store, null, 2));
-  fs.renameSync(temporaryPath, storePath);
-}
-
-function hashApiKey(apiKey) {
-  return crypto
-    .createHmac('sha256', apiKeySalt)
-    .update(apiKey)
-    .digest('hex');
-}
-
-function generateApiKey() {
-  return `pdfgen_${crypto.randomBytes(24).toString('hex')}`;
-}
-
-function currentMonth() {
+function monthId() {
   const now = new Date();
-  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  return `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}`;
 }
 
-function nextMonthStart() {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+function generateApiKey(tier = 'free') {
+  const key = `pdfgen_${tier}_${uuidv4().replace(/-/g, '')}`;
+  apiKeys.set(key, {
+    tier,
+    createdAt: new Date().toISOString(),
+    stripeCustomerId: null,
+    stripeSubscriptionId: null
+  });
+  usageTracker.set(key, { month: monthId(), count: 0 });
+  return key;
 }
 
-function getUsage(userId) {
-  const key = `${userId}:${currentMonth()}`;
-  return {
-    key,
-    count: Number(store.usage[key] || 0)
-  };
-}
-
-function consumeOperations(user, amount) {
-  const plan = plans[user.plan] || plans.free;
-  const usage = getUsage(user.id);
-
-  if (usage.count + amount > plan.monthlyOperations) {
-    return {
-      allowed: false,
-      used: usage.count,
-      limit: plan.monthlyOperations,
-      remaining: Math.max(0, plan.monthlyOperations - usage.count),
-      resetAt: nextMonthStart().toISOString()
-    };
+function getUsage(apiKey) {
+  let usage = usageTracker.get(apiKey);
+  if (!usage || usage.month !== monthId()) {
+    usage = { month: monthId(), count: 0 };
+    usageTracker.set(apiKey, usage);
   }
-
-  store.usage[usage.key] = usage.count + amount;
-  saveStore();
-
-  return {
-    allowed: true,
-    used: usage.count + amount,
-    limit: plan.monthlyOperations,
-    remaining: plan.monthlyOperations - usage.count - amount,
-    resetAt: nextMonthStart().toISOString()
-  };
-}
-
-function findUserById(userId) {
-  return Object.values(store.users).find((user) => user.id === userId) || null;
-}
-
-function findUserByEmail(email) {
-  const normalizedEmail = email.trim().toLowerCase();
-  return Object.values(store.users).find(
-    (user) => user.email === normalizedEmail
-  ) || null;
-}
-
-function findUserByCustomerId(customerId) {
-  return Object.values(store.users).find(
-    (user) => user.stripeCustomerId === customerId
-  ) || null;
-}
-
-function findUserBySubscriptionId(subscriptionId) {
-  return Object.values(store.users).find(
-    (user) => user.stripeSubscriptionId === subscriptionId
-  ) || null;
-}
-
-function publicPlan(plan) {
-  return {
-    id: plan.id,
-    name: plan.name,
-    monthlyOperations: plan.monthlyOperations,
-    watermark: plan.watermark,
-    checkoutAvailable: Boolean(stripe && plan.priceId)
-  };
+  return usage;
 }
 
 function authenticate(req, res, next) {
   const authorization = req.get('authorization') || '';
-
   if (!authorization.startsWith('Bearer ')) {
     return res.status(401).json({
-      error: 'Authorization must use Bearer <api_key>'
+      error: 'Use the Authorization header with Bearer <api_key>'
     });
   }
 
-  const suppliedKey = authorization.slice(7).trim();
-  if (!suppliedKey) {
-    return res.status(401).json({ error: 'API key is required' });
-  }
+  const apiKey = authorization.slice(7).trim();
+  const keyRecord = apiKeys.get(apiKey);
 
-  const user = store.users[hashApiKey(suppliedKey)];
-  if (!user) {
+  if (!keyRecord) {
     return res.status(401).json({ error: 'Invalid API key' });
   }
 
-  req.user = user;
-  next();
+  req.apiKey = apiKey;
+  req.keyRecord = keyRecord;
+  req.tier = keyRecord.tier;
+  req.limits = tierLimits[keyRecord.tier] || tierLimits.free;
+  return next();
 }
 
-function requireString(value, fieldName, maximumLength) {
-  if (typeof value !== 'string' || value.trim() === '') {
-    const error = new Error(`${fieldName} must be a non-empty string`);
-    error.status = 400;
-    throw error;
+function enforceUsage(req, res, next) {
+  const usage = getUsage(req.apiKey);
+  if (usage.count >= req.limits.monthlyRenders) {
+    return res.status(429).json({
+      error: 'Monthly render limit exceeded',
+      used: usage.count,
+      limit: req.limits.monthlyRenders
+    });
   }
-
-  if (value.length > maximumLength) {
-    const error = new Error(
-      `${fieldName} exceeds the maximum length of ${maximumLength}`
-    );
-    error.status = 400;
-    throw error;
-  }
-
-  return value;
+  return next();
 }
 
-function interpolate(input, values) {
-  if (!values || typeof values !== 'object' || Array.isArray(values)) {
-    return input;
-  }
-
-  return input.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (match, key) => {
-    const value = key.split('.').reduce((current, part) => {
-      if (
-        current !== null &&
-        typeof current === 'object' &&
-        Object.prototype.hasOwnProperty.call(current, part)
-      ) {
-        return current[part];
-      }
-      return undefined;
-    }, values);
-
-    if (value === undefined || value === null) {
-      return '';
-    }
-
-    return String(value);
-  });
+function incrementUsage(apiKey) {
+  getUsage(apiKey).count += 1;
 }
 
-function escapeHtml(input) {
-  return String(input)
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
@@ -250,744 +198,510 @@ function escapeHtml(input) {
     .replaceAll("'", '&#039;');
 }
 
-function composeTemplate(template, data) {
-  const html = interpolate(template.html, data);
-  const css = interpolate(template.css || '', data);
+function renderTemplate(template, data) {
+  const items = Array.isArray(data.items)
+    ? data.items.map((item) => {
+      return `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.qty)}</td><td>$${escapeHtml(item.price)}</td><td>$${escapeHtml(item.total)}</td></tr>`;
+    }).join('')
+    : '';
 
-  return [
-    '<!doctype html>',
-    '<html>',
-    '<head>',
-    '<meta charset="utf-8">',
-    `<style>${css}</style>`,
-    '</head>',
-    `<body>${html}</body>`,
-    '</html>'
-  ].join('');
-}
-
-function addWatermark(html, text) {
-  const watermark = [
-    '<div style="',
-    'position:fixed;',
-    'top:48%;',
-    'left:12%;',
-    'right:12%;',
-    'transform:rotate(-35deg);',
-    'font:700 52px Arial,sans-serif;',
-    'text-align:center;',
-    'color:rgba(0,0,0,0.10);',
-    'z-index:2147483647;',
-    'pointer-events:none;',
-    '">',
-    escapeHtml(text),
-    '</div>'
-  ].join('');
-
-  if (/<body[^>]*>/i.test(html)) {
-    return html.replace(/<body([^>]*)>/i, `<body$1>${watermark}`);
-  }
-
-  return `<!doctype html><html><head><meta charset="utf-8"></head><body>${watermark}${html}</body></html>`;
-}
-
-function normalizeMargins(value) {
-  const defaultMargins = {
-    top: '20mm',
-    right: '15mm',
-    bottom: '20mm',
-    left: '15mm'
+  const values = {
+    companyName: data.companyName,
+    invoiceNumber: data.invoiceNumber,
+    total: data.total,
+    items
   };
 
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return defaultMargins;
-  }
-
-  return {
-    top: String(value.top || defaultMargins.top),
-    right: String(value.right || defaultMargins.right),
-    bottom: String(value.bottom || defaultMargins.bottom),
-    left: String(value.left || defaultMargins.left)
-  };
+  return template.html.replace(/\{\{([a-zA-Z0-9_]+)\}\}/g, (match, key) => {
+    return key === 'items' ? values.items : escapeHtml(values[key]);
+  });
 }
-
-function safePdfOptions(options = {}) {
-  const allowedFormats = new Set([
-    'Letter',
-    'Legal',
-    'Tabloid',
-    'Ledger',
-    'A0',
-    'A1',
-    'A2',
-    'A3',
-    'A4',
-    'A5',
-    'A6'
-  ]);
-
-  const format = allowedFormats.has(options.format) ? options.format : 'A4';
-  const headerTemplate =
-    typeof options.headerTemplate === 'string'
-      ? options.headerTemplate.slice(0, 50000)
-      : '';
-  const footerTemplate =
-    typeof options.footerTemplate === 'string'
-      ? options.footerTemplate.slice(0, 50000)
-      : '';
-  const displayHeaderFooter = Boolean(
-    options.displayHeaderFooter || headerTemplate || footerTemplate
-  );
-
-  return {
-    format,
-    landscape: Boolean(options.landscape),
-    margin: normalizeMargins(options.margin),
-    printBackground: options.printBackground !== false,
-    preferCSSPageSize: Boolean(options.preferCSSPageSize),
-    displayHeaderFooter,
-    headerTemplate:
-      headerTemplate ||
-      '<div style="font-size:8px;width:100%;text-align:center"></div>',
-    footerTemplate:
-      footerTemplate ||
-      '<div style="font-size:9px;width:100%;text-align:center;color:#666"><span class="pageNumber"></span> / <span class="totalPages"></span></div>'
-  };
-}
-
-let browserPromise = null;
 
 async function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = puppeteer.launch({
+  if (!browser || !browser.isConnected()) {
+    browser = await puppeteer.launch({
       headless: true,
-      executablePath:
-        process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--no-zygote'
       ]
-    }).catch((error) => {
-      browserPromise = null;
-      throw error;
+    });
+  }
+  return browser;
+}
+
+async function addWatermark(pdfBytes, text) {
+  const pdf = await PDFDocument.load(pdfBytes);
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+
+  for (const page of pdf.getPages()) {
+    const { width, height } = page.getSize();
+    const size = Math.min(48, Math.max(18, width / 12));
+    const textWidth = font.widthOfTextAtSize(text, size);
+    page.drawText(text, {
+      x: (width - textWidth) / 2,
+      y: height / 2,
+      size,
+      font,
+      color: rgb(0.6, 0.6, 0.6),
+      opacity: 0.3,
+      rotate: degrees(-35)
     });
   }
 
-  return browserPromise;
+  return Buffer.from(await pdf.save());
 }
 
-async function renderPdf(html, options) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+async function addArchiveMetadata(pdfBytes) {
+  const pdf = await PDFDocument.load(pdfBytes);
+  pdf.setTitle('Archived PDF document');
+  pdf.setAuthor('PdfGenerator API');
+  pdf.setCreator('PdfGenerator API');
+  pdf.setProducer('PdfGenerator API');
+  pdf.setCreationDate(new Date());
+  pdf.setModificationDate(new Date());
+  return Buffer.from(await pdf.save({ useObjectStreams: false }));
+}
+
+async function renderPdf(html, css, options, limits) {
+  const browserInstance = await getBrowser();
+  const page = await browserInstance.newPage();
 
   try {
     await page.setRequestInterception(true);
     page.on('request', (request) => {
-      const resourceUrl = request.url();
-      if (
-        resourceUrl.startsWith('data:') ||
-        resourceUrl.startsWith('about:') ||
-        resourceUrl.startsWith('blob:')
-      ) {
-        request.continue();
-      } else {
+      const url = request.url();
+      if (url.startsWith('file:') || url.startsWith('ftp:')) {
         request.abort();
+      } else {
+        request.continue();
       }
     });
 
-    await page.setContent(html, {
-      waitUntil: 'domcontentloaded',
+    const fontStyles = limits.customFonts && Array.isArray(options.customFonts)
+      ? options.customFonts.map((fontUrl, index) => {
+        return `@font-face{font-family:"CustomFont${index}";src:url("${fontUrl}") format("woff2");font-display:swap;}`;
+      }).join('')
+      : '';
+
+    const documentHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${fontStyles}${css || ''}</style></head><body>${html}</body></html>`;
+    await page.setContent(documentHtml, {
+      waitUntil: 'networkidle0',
       timeout: 30000
     });
 
-    const result = await page.pdf(safePdfOptions(options));
-    return Buffer.from(result);
+    let pdfBytes = Buffer.from(await page.pdf({
+      format: options.format || 'A4',
+      margin: options.margin || {
+        top: '20mm',
+        right: '20mm',
+        bottom: '20mm',
+        left: '20mm'
+      },
+      printBackground: options.printBackground !== false,
+      landscape: Boolean(options.landscape),
+      pageRanges: options.pageRanges || '',
+      displayHeaderFooter: Boolean(options.displayHeaderFooter),
+      headerTemplate: options.headerTemplate || '<span></span>',
+      footerTemplate: options.footerTemplate || '<div style="font-size:9px;width:100%;text-align:center"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
+      preferCSSPageSize: true
+    }));
+
+    if (limits.watermark) {
+      pdfBytes = await addWatermark(
+        pdfBytes,
+        options.watermark || 'Generated by PdfGenerator API Free Tier'
+      );
+    } else if (options.watermark) {
+      pdfBytes = await addWatermark(pdfBytes, options.watermark);
+    }
+
+    if (options.pdfa && !limits.watermark) {
+      pdfBytes = await addArchiveMetadata(pdfBytes);
+    }
+
+    return pdfBytes;
   } finally {
     await page.close();
   }
 }
 
-function setUsageHeaders(res, usage) {
-  res.set({
-    'X-RateLimit-Limit': String(usage.limit),
-    'X-RateLimit-Remaining': String(usage.remaining),
-    'X-RateLimit-Reset': usage.resetAt
-  });
+async function mergeRemotePdfs(urls) {
+  const merged = await PDFDocument.create();
+
+  for (const url of urls) {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('Only HTTP and HTTPS PDF URLs are supported');
+    }
+
+    const response = await fetch(parsed, {
+      signal: AbortSignal.timeout(20000),
+      redirect: 'follow'
+    });
+
+    if (!response.ok) {
+      throw new Error(`Unable to download PDF: ${response.status}`);
+    }
+
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    if (contentLength > 20 * 1024 * 1024) {
+      throw new Error('A source PDF exceeds the 20 MB limit');
+    }
+
+    const bytes = await response.arrayBuffer();
+    if (bytes.byteLength > 20 * 1024 * 1024) {
+      throw new Error('A source PDF exceeds the 20 MB limit');
+    }
+
+    const source = await PDFDocument.load(bytes);
+    const pages = await merged.copyPages(source, source.getPageIndices());
+    pages.forEach((page) => merged.addPage(page));
+  }
+
+  return Buffer.from(await merged.save());
 }
+
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors());
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false
+}));
 
 app.post(
   '/api/webhooks/stripe',
-  express.raw({ type: 'application/json', limit: '1mb' }),
+  express.raw({ type: 'application/json' }),
   async (req, res) => {
     if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      return res.status(503).json({
-        error: 'Stripe webhook configuration is unavailable'
-      });
+      return res.status(503).json({ error: 'Stripe webhook is not configured' });
     }
 
-    const signature = req.get('stripe-signature');
     let event;
-
     try {
       event = stripe.webhooks.constructEvent(
         req.body,
-        signature,
+        req.get('stripe-signature'),
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (error) {
-      return res.status(400).json({
-        error: `Invalid Stripe webhook: ${error.message}`
-      });
+      return res.status(400).send(`Webhook Error: ${error.message}`);
     }
 
-    try {
-      if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        const user = findUserById(session.metadata?.userId);
-        const requestedPlan = session.metadata?.plan;
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const apiKey = session.metadata && session.metadata.apiKey;
+      const tier = session.metadata && session.metadata.tier;
+      const keyRecord = apiKeys.get(apiKey);
 
-        if (
-          user &&
-          plans[requestedPlan] &&
-          requestedPlan !== 'free' &&
-          session.payment_status !== 'unpaid'
-        ) {
-          user.plan = requestedPlan;
-          user.stripeCustomerId =
-            typeof session.customer === 'string'
-              ? session.customer
-              : session.customer?.id || user.stripeCustomerId;
-          user.stripeSubscriptionId =
-            typeof session.subscription === 'string'
-              ? session.subscription
-              : session.subscription?.id || null;
-          user.updatedAt = new Date().toISOString();
-          saveStore();
-        }
+      if (keyRecord && tierLimits[tier]) {
+        keyRecord.tier = tier;
+        keyRecord.stripeCustomerId = session.customer || null;
+        keyRecord.stripeSubscriptionId = session.subscription || null;
       }
-
-      if (
-        event.type === 'customer.subscription.updated' ||
-        event.type === 'customer.subscription.deleted'
-      ) {
-        const subscription = event.data.object;
-        const customerId =
-          typeof subscription.customer === 'string'
-            ? subscription.customer
-            : subscription.customer?.id;
-        const user =
-          findUserBySubscriptionId(subscription.id) ||
-          findUserByCustomerId(customerId);
-
-        if (user) {
-          const activeStatuses = new Set(['active', 'trialing']);
-          const priceId = subscription.items?.data?.[0]?.price?.id;
-          const matchingPlan = Object.values(plans).find(
-            (plan) => plan.priceId && plan.priceId === priceId
-          );
-
-          if (
-            event.type === 'customer.subscription.deleted' ||
-            !activeStatuses.has(subscription.status)
-          ) {
-            user.plan = 'free';
-            user.stripeSubscriptionId = null;
-          } else if (matchingPlan) {
-            user.plan = matchingPlan.id;
-            user.stripeSubscriptionId = subscription.id;
-          }
-
-          user.updatedAt = new Date().toISOString();
-          saveStore();
-        }
-      }
-
-      return res.json({ received: true });
-    } catch (error) {
-      console.error('Stripe webhook processing error:', error);
-      return res.status(500).json({ error: 'Webhook processing failed' });
     }
+
+    if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      for (const keyRecord of apiKeys.values()) {
+        if (keyRecord.stripeSubscriptionId === subscription.id) {
+          keyRecord.tier = 'free';
+          keyRecord.stripeSubscriptionId = null;
+        }
+      }
+    }
+
+    return res.json({ received: true });
   }
 );
 
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false
-  })
-);
-app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: false, limit: '1mb' }));
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    limit: 200,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many requests' }
-  })
-);
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-app.get('/', (req, res) => {
+app.get('/api/health', (req, res) => {
   res.json({
-    service: 'PDF Generator API',
-    version: '1.0.0',
-    health: '/api/health',
-    plans: '/api/plans'
-  });
-});
-
-app.get('/api/health', async (req, res) => {
-  let browserStatus = 'not_started';
-
-  if (browserPromise) {
-    try {
-      const browser = await browserPromise;
-      browserStatus = browser.connected ? 'connected' : 'disconnected';
-    } catch (error) {
-      browserStatus = 'unavailable';
-    }
-  }
-
-  res.json({
-    status: 'ok',
+    status: 'healthy',
     version: '1.0.0',
     timestamp: new Date().toISOString(),
-    uptimeSeconds: Math.floor(process.uptime()),
-    browser: browserStatus,
-    stripeConfigured: Boolean(stripe)
+    uptime: process.uptime(),
+    browser: browser && browser.isConnected() ? 'connected' : 'idle',
+    queue: redis ? 'configured' : 'disabled'
   });
 });
 
-app.get('/api/plans', (req, res) => {
-  res.json({
-    plans: Object.values(plans).map(publicPlan)
-  });
-});
-
-app.post('/api/auth/register', (req, res) => {
-  const email =
-    typeof req.body.email === 'string'
-      ? req.body.email.trim().toLowerCase()
-      : '';
-
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320) {
-    return res.status(400).json({ error: 'A valid email address is required' });
-  }
-
-  if (findUserByEmail(email)) {
-    return res.status(409).json({
-      error: 'This email address is already registered'
-    });
-  }
-
-  const apiKey = generateApiKey();
-  const keyHash = hashApiKey(apiKey);
-  const now = new Date().toISOString();
-
-  const user = {
-    id: uuidv4(),
-    email,
-    plan: 'free',
-    stripeCustomerId: null,
-    stripeSubscriptionId: null,
-    createdAt: now,
-    updatedAt: now
-  };
-
-  store.users[keyHash] = user;
-  saveStore();
-
-  return res.status(201).json({
+app.post('/api/keys', (req, res) => {
+  const apiKey = generateApiKey('free');
+  res.status(201).json({
+    message: 'Save this API key because it will not be shown again.',
     apiKey,
-    userId: user.id,
-    plan: user.plan,
-    message: 'Store the API key securely because it cannot be retrieved later'
+    tier: 'free',
+    limits: tierLimits.free
   });
-});
-
-app.get('/api/account', authenticate, (req, res) => {
-  res.json({
-    id: req.user.id,
-    email: req.user.email,
-    plan: req.user.plan,
-    createdAt: req.user.createdAt
-  });
-});
-
-app.get('/api/usage', authenticate, (req, res) => {
-  const plan = plans[req.user.plan] || plans.free;
-  const usage = getUsage(req.user.id);
-
-  res.json({
-    plan: publicPlan(plan),
-    used: usage.count,
-    limit: plan.monthlyOperations,
-    remaining: Math.max(0, plan.monthlyOperations - usage.count),
-    resetAt: nextMonthStart().toISOString()
-  });
-});
-
-app.post('/api/billing/checkout', authenticate, async (req, res, next) => {
-  try {
-    const requestedPlan = req.body.plan;
-
-    if (!plans[requestedPlan] || requestedPlan === 'free') {
-      return res.status(400).json({
-        error: 'A valid paid plan is required'
-      });
-    }
-
-    if (!stripe) {
-      return res.status(503).json({
-        error: 'Stripe checkout is not configured'
-      });
-    }
-
-    const plan = plans[requestedPlan];
-    if (!plan.priceId) {
-      return res.status(503).json({
-        error: `${plan.name} checkout is not configured`
-      });
-    }
-
-    let customerId = req.user.stripeCustomerId;
-
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: req.user.email,
-        metadata: {
-          userId: req.user.id
-        }
-      });
-
-      customerId = customer.id;
-      req.user.stripeCustomerId = customerId;
-      req.user.updatedAt = new Date().toISOString();
-      saveStore();
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      customer: customerId,
-      mode: 'subscription',
-      line_items: [
-        {
-          price: plan.priceId,
-          quantity: 1
-        }
-      ],
-      allow_promotion_codes: true,
-      success_url: `${appUrl}/api/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${appUrl}/api/billing/cancel`,
-      metadata: {
-        userId: req.user.id,
-        plan: requestedPlan
-      },
-      subscription_data: {
-        metadata: {
-          userId: req.user.id,
-          plan: requestedPlan
-        }
-      }
-    });
-
-    return res.json({
-      checkoutUrl: session.url,
-      sessionId: session.id
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get('/api/billing/success', (req, res) => {
-  res.json({
-    status: 'checkout_completed',
-    message: 'The subscription will be activated after Stripe confirms payment'
-  });
-});
-
-app.get('/api/billing/cancel', (req, res) => {
-  res.json({
-    status: 'checkout_cancelled'
-  });
-});
-
-app.post('/api/templates', authenticate, (req, res, next) => {
-  try {
-    const name = requireString(req.body.name, 'name', 200);
-    const html = requireString(req.body.html, 'html', 1000000);
-    const css =
-      typeof req.body.css === 'string'
-        ? req.body.css.slice(0, 250000)
-        : '';
-
-    const id = uuidv4();
-    const template = {
-      id,
-      userId: req.user.id,
-      name,
-      html,
-      css,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    store.templates[id] = template;
-    saveStore();
-
-    return res.status(201).json({
-      id: template.id,
-      name: template.name,
-      createdAt: template.createdAt
-    });
-  } catch (error) {
-    next(error);
-  }
 });
 
 app.get('/api/templates', authenticate, (req, res) => {
-  const templates = Object.values(store.templates)
-    .filter((template) => template.userId === req.user.id)
-    .map((template) => ({
-      id: template.id,
-      name: template.name,
-      createdAt: template.createdAt,
-      updatedAt: template.updatedAt
-    }));
-
-  res.json({ templates });
+  res.json({
+    templates: Array.from(templates.keys()).map((id) => ({ id, name: id }))
+  });
 });
 
-app.get('/api/templates/:templateId', authenticate, (req, res) => {
-  const template = store.templates[req.params.templateId];
-
-  if (!template || template.userId !== req.user.id) {
-    return res.status(404).json({ error: 'Template not found' });
+app.post('/api/templates', authenticate, (req, res) => {
+  if (req.tier === 'free') {
+    return res.status(403).json({ error: 'Custom templates require a paid tier' });
   }
 
-  return res.json(template);
-});
-
-app.put('/api/templates/:templateId', authenticate, (req, res, next) => {
-  try {
-    const template = store.templates[req.params.templateId];
-
-    if (!template || template.userId !== req.user.id) {
-      return res.status(404).json({ error: 'Template not found' });
-    }
-
-    if (req.body.name !== undefined) {
-      template.name = requireString(req.body.name, 'name', 200);
-    }
-
-    if (req.body.html !== undefined) {
-      template.html = requireString(req.body.html, 'html', 1000000);
-    }
-
-    if (req.body.css !== undefined) {
-      if (typeof req.body.css !== 'string') {
-        return res.status(400).json({ error: 'css must be a string' });
-      }
-      template.css = req.body.css.slice(0, 250000);
-    }
-
-    template.updatedAt = new Date().toISOString();
-    saveStore();
-
-    return res.json({
-      id: template.id,
-      name: template.name,
-      updatedAt: template.updatedAt
+  const { id, html, css = '' } = req.body;
+  if (
+    typeof id !== 'string' ||
+    !/^[a-zA-Z0-9_-]{1,64}$/.test(id) ||
+    typeof html !== 'string' ||
+    html.length === 0
+  ) {
+    return res.status(400).json({
+      error: 'A valid id and non-empty html value are required'
     });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.delete('/api/templates/:templateId', authenticate, (req, res) => {
-  const template = store.templates[req.params.templateId];
-
-  if (!template || template.userId !== req.user.id) {
-    return res.status(404).json({ error: 'Template not found' });
   }
 
-  delete store.templates[req.params.templateId];
-  saveStore();
-
-  return res.status(204).send();
+  templates.set(id, { html, css });
+  return res.status(201).json({ id, created: true });
 });
 
-app.post('/api/render', authenticate, async (req, res, next) => {
-  try {
-    const hasHtml = typeof req.body.html === 'string' && req.body.html.trim();
-    const hasTemplateId =
-      typeof req.body.templateId === 'string' && req.body.templateId.trim();
+app.get('/api/usage', authenticate, (req, res) => {
+  const usage = getUsage(req.apiKey);
+  const resetDate = new Date();
+  resetDate.setUTCMonth(resetDate.getUTCMonth() + 1, 1);
+  resetDate.setUTCHours(0, 0, 0, 0);
 
-    if (!hasHtml && !hasTemplateId) {
+  res.json({
+    tier: req.tier,
+    used: usage.count,
+    limit: req.limits.monthlyRenders,
+    remaining: Math.max(0, req.limits.monthlyRenders - usage.count),
+    resetDate: resetDate.toISOString()
+  });
+});
+
+app.post('/api/render', authenticate, enforceUsage, async (req, res) => {
+  const validation = validator.validate(req.body, renderSchema);
+  if (!validation.valid) {
+    return res.status(400).json({
+      error: 'Invalid request body',
+      details: validation.errors.map((entry) => entry.stack)
+    });
+  }
+
+  const {
+    html,
+    css = '',
+    templateId,
+    data,
+    options = {},
+    async: asynchronous = false,
+    webhookUrl,
+    mergePdfs
+  } = req.body;
+
+  if (Array.isArray(mergePdfs)) {
+    if (!req.limits.async) {
+      return res.status(403).json({ error: 'PDF merging requires a paid tier' });
+    }
+    if (!webhookUrl) {
+      return res.status(400).json({ error: 'webhookUrl is required for PDF merging' });
+    }
+    if (!mergeQueue) {
+      return res.status(503).json({ error: 'Asynchronous queue is not configured' });
+    }
+
+    const jobId = uuidv4();
+    await mergeQueue.add('merge', {
+      jobId,
+      pdfUrls: mergePdfs,
+      webhookUrl,
+      apiKey: req.apiKey
+    });
+    incrementUsage(req.apiKey);
+
+    return res.status(202).json({ jobId, status: 'queued' });
+  }
+
+  let finalHtml = html;
+  let finalCss = css;
+
+  if (templateId) {
+    const template = templates.get(templateId);
+    if (!template) {
+      return res.status(404).json({ error: `Template not found: ${templateId}` });
+    }
+    finalHtml = renderTemplate(template, data || {});
+    finalCss = template.css;
+  }
+
+  if (asynchronous) {
+    if (!req.limits.async) {
+      return res.status(403).json({
+        error: 'Asynchronous rendering requires a paid tier'
+      });
+    }
+    if (!webhookUrl) {
       return res.status(400).json({
-        error: 'html or templateId is required'
+        error: 'webhookUrl is required for asynchronous rendering'
+      });
+    }
+    if (!renderQueue) {
+      return res.status(503).json({
+        error: 'Asynchronous queue is not configured'
       });
     }
 
-    if (hasHtml && req.body.html.length > 1000000) {
-      return res.status(413).json({
-        error: 'html exceeds the maximum length of 1000000'
-      });
-    }
+    const jobId = uuidv4();
+    await renderQueue.add('render', {
+      jobId,
+      html: finalHtml,
+      css: finalCss,
+      options,
+      webhookUrl,
+      tier: req.tier,
+      apiKey: req.apiKey
+    });
+    incrementUsage(req.apiKey);
 
-    let html;
+    return res.status(202).json({ jobId, status: 'queued' });
+  }
 
-    if (hasTemplateId) {
-      const template = store.templates[req.body.templateId];
-
-      if (!template || template.userId !== req.user.id) {
-        return res.status(404).json({ error: 'Template not found' });
-      }
-
-      html = composeTemplate(template, req.body.data);
-    } else {
-      html = interpolate(req.body.html, req.body.data);
-    }
-
-    const plan = plans[req.user.plan] || plans.free;
-    if (plan.watermark) {
-      html = addWatermark(html, 'PDF Generator Free Tier');
-    }
-
-    const usage = consumeOperations(req.user, 1);
-    if (!usage.allowed) {
-      return res.status(429).json({
-        error: 'Monthly operation limit exceeded',
-        used: usage.used,
-        limit: usage.limit,
-        remaining: usage.remaining,
-        resetAt: usage.resetAt
-      });
-    }
-
-    const pdf = await renderPdf(html, req.body.options || {});
-    setUsageHeaders(res, usage);
-
-    const requestedFilename =
-      typeof req.body.filename === 'string'
-        ? req.body.filename.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120)
-        : 'document.pdf';
-    const filename = requestedFilename.toLowerCase().endsWith('.pdf')
-      ? requestedFilename
-      : `${requestedFilename}.pdf`;
-
+  try {
+    const pdf = await renderPdf(finalHtml, finalCss, options, req.limits);
+    incrementUsage(req.apiKey);
     res.set({
       'Content-Type': 'application/pdf',
       'Content-Length': String(pdf.length),
-      'Content-Disposition': `attachment; filename="${filename}"`
+      'Content-Disposition': 'attachment; filename="document.pdf"',
+      'Cache-Control': 'no-store'
     });
-
     return res.send(pdf);
   } catch (error) {
-    next(error);
+    console.error('PDF generation failed:', error);
+    return res.status(500).json({
+      error: 'PDF generation failed',
+      message: error.message
+    });
   }
 });
 
-app.post('/api/merge', authenticate, async (req, res, next) => {
-  try {
-    const pdfs = req.body.pdfs;
+app.post('/api/merge', authenticate, enforceUsage, async (req, res) => {
+  if (req.tier === 'free') {
+    return res.status(403).json({ error: 'PDF merging requires a paid tier' });
+  }
 
-    if (!Array.isArray(pdfs) || pdfs.length < 2 || pdfs.length > 20) {
-      return res.status(400).json({
-        error: 'pdfs must contain between 2 and 20 base64-encoded PDFs'
-      });
-    }
-
-    const decodedPdfs = pdfs.map((encoded, index) => {
-      if (typeof encoded !== 'string' || encoded.length > 15000000) {
-        const error = new Error(`PDF at index ${index} is invalid or too large`);
-        error.status = 400;
-        throw error;
-      }
-
-      const normalized = encoded.includes(',')
-        ? encoded.slice(encoded.indexOf(',') + 1)
-        : encoded;
-      return Buffer.from(normalized, 'base64');
+  const urls = req.body.urls;
+  if (!Array.isArray(urls) || urls.length < 2 || urls.length > 20) {
+    return res.status(400).json({
+      error: 'urls must contain between 2 and 20 PDF URLs'
     });
+  }
 
-    const usage = consumeOperations(req.user, decodedPdfs.length);
-    if (!usage.allowed) {
-      return res.status(429).json({
-        error: 'Monthly operation limit exceeded',
-        used: usage.used,
-        limit: usage.limit,
-        remaining: usage.remaining,
-        resetAt: usage.resetAt
-      });
-    }
-
-    const mergedDocument = await PDFDocument.create();
-
-    for (const input of decodedPdfs) {
-      const sourceDocument = await PDFDocument.load(input);
-      const copiedPages = await mergedDocument.copyPages(
-        sourceDocument,
-        sourceDocument.getPageIndices()
-      );
-      copiedPages.forEach((page) => mergedDocument.addPage(page));
-    }
-
-    const mergedBytes = await mergedDocument.save();
-    const merged = Buffer.from(mergedBytes);
-    setUsageHeaders(res, usage);
-
+  try {
+    const pdf = await mergeRemotePdfs(urls);
+    incrementUsage(req.apiKey);
     res.set({
       'Content-Type': 'application/pdf',
-      'Content-Length': String(merged.length),
-      'Content-Disposition': 'attachment; filename="merged.pdf"'
+      'Content-Length': String(pdf.length),
+      'Content-Disposition': 'attachment; filename="merged.pdf"',
+      'Cache-Control': 'no-store'
+    });
+    return res.send(pdf);
+  } catch (error) {
+    return res.status(400).json({
+      error: 'PDF merge failed',
+      message: error.message
+    });
+  }
+});
+
+app.post('/api/billing/checkout', authenticate, async (req, res) => {
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe billing is not configured' });
+  }
+
+  const tier = req.body.tier;
+  const prices = {
+    starter: process.env.STRIPE_PRICE_STARTER,
+    pro: process.env.STRIPE_PRICE_PRO,
+    enterprise: process.env.STRIPE_PRICE_ENTERPRISE
+  };
+
+  if (!prices[tier]) {
+    return res.status(400).json({
+      error: 'Select a configured paid tier: starter, pro, or enterprise'
+    });
+  }
+
+  const baseUrl = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: prices[tier], quantity: 1 }],
+      success_url: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl}/billing/cancel`,
+      client_reference_id: req.apiKey,
+      metadata: {
+        apiKey: req.apiKey,
+        tier
+      },
+      subscription_data: {
+        metadata: {
+          apiKey: req.apiKey,
+          tier
+        }
+      }
     });
 
-    return res.send(merged);
+    return res.json({ url: session.url });
   } catch (error) {
-    next(error);
+    console.error('Stripe checkout failed:', error);
+    return res.status(500).json({ error: 'Unable to create checkout session' });
   }
+});
+
+app.get('/billing/success', (req, res) => {
+  res.type('html').send('<!doctype html><html><body><h1>Subscription activated</h1><p>Your API tier will update after Stripe confirms payment.</p></body></html>');
+});
+
+app.get('/billing/cancel', (req, res) => {
+  res.type('html').send('<!doctype html><html><body><h1>Checkout canceled</h1><p>No changes were made to your subscription.</p></body></html>');
 });
 
 app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
+  res.status(404).json({ error: 'Route not found' });
 });
 
 app.use((error, req, res, next) => {
-  console.error(error);
-  const status = Number(error.status || 500);
-
-  res.status(status).json({
-    error: status >= 500 ? 'Internal server error' : error.message
-  });
+  console.error('Unhandled server error:', error);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 const server = app.listen(port, () => {
-  console.log(`PDF Generator API listening on port ${port}`);
+  console.log(`PdfGenerator API listening on port ${port}`);
 });
 
-async function shutdown(signal) {
-  console.log(`Received ${signal}; shutting down`);
-
+async function shutdown() {
   server.close(async () => {
-    try {
-      if (browserPromise) {
-        const browser = await browserPromise;
-        await browser.close();
-      }
-    } catch (error) {
-      console.error('Browser shutdown error:', error.message);
-    }
-
+    if (renderQueue) await renderQueue.close();
+    if (mergeQueue) await mergeQueue.close();
+    if (browser) await browser.close();
+    if (redis) await redis.quit();
     process.exit(0);
   });
-
-  setTimeout(() => process.exit(1), 10000).unref();
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+module.exports = app;
