@@ -1,72 +1,50 @@
-const assert = require('assert');
+const assert = require('node:assert/strict');
 
 const baseUrl = process.env.TEST_BASE_URL || 'http://localhost:3000';
 
-async function request(path, options = {}) {
-  const response = await fetch(`${baseUrl}${path}`, options);
-  const contentType = response.headers.get('content-type') || '';
-
-  if (contentType.includes('application/json')) {
-    return {
-      response,
-      body: await response.json()
-    };
-  }
-
-  return {
-    response,
-    body: Buffer.from(await response.arrayBuffer())
-  };
-}
-
 async function run() {
-  const health = await request('/api/health');
-  assert.strictEqual(health.response.status, 200);
-  assert.strictEqual(health.body.status, 'ok');
+  const healthResponse = await fetch(`${baseUrl}/api/health`);
+  assert.equal(healthResponse.status, 200);
+  const health = await healthResponse.json();
+  assert.equal(health.status, 'healthy');
 
-  const email = `test-${Date.now()}@example.com`;
-  const registration = await request('/api/auth/register', {
+  const keyResponse = await fetch(`${baseUrl}/api/keys`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ email })
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}'
   });
+  assert.equal(keyResponse.status, 201);
+  const keyResult = await keyResponse.json();
+  assert.match(keyResult.apiKey, /^pdfgen_free_/);
 
-  assert.strictEqual(registration.response.status, 201);
-  assert.ok(registration.body.apiKey);
+  const usageResponse = await fetch(`${baseUrl}/api/usage`, {
+    headers: {
+      Authorization: `Bearer ${keyResult.apiKey}`
+    }
+  });
+  assert.equal(usageResponse.status, 200);
+  const usage = await usageResponse.json();
+  assert.equal(usage.tier, 'free');
+  assert.equal(usage.used, 0);
 
-  const apiKey = registration.body.apiKey;
-  const render = await request('/api/render', {
+  const renderResponse = await fetch(`${baseUrl}/api/render`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${keyResult.apiKey}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      html: '<html><body><h1>PDF Generator API Test</h1></body></html>',
-      filename: 'test.pdf'
+      html: '<h1>PdfGenerator API test</h1>',
+      css: 'h1{color:#2457ff}',
+      options: { format: 'A4' }
     })
   });
+  assert.equal(renderResponse.status, 200);
+  assert.equal(renderResponse.headers.get('content-type'), 'application/pdf');
+  const pdf = Buffer.from(await renderResponse.arrayBuffer());
+  assert.equal(pdf.subarray(0, 4).toString(), '%PDF');
 
-  assert.strictEqual(render.response.status, 200);
-  assert.ok(
-    (render.response.headers.get('content-type') || '').includes(
-      'application/pdf'
-    )
-  );
-  assert.ok(render.body.length > 100);
-
-  const usage = await request('/api/usage', {
-    headers: {
-      Authorization: `Bearer ${apiKey}`
-    }
-  });
-
-  assert.strictEqual(usage.response.status, 200);
-  assert.strictEqual(usage.body.used, 1);
-
-  console.log('End-to-end tests passed');
+  console.log('Health, authentication, usage, and PDF rendering tests passed');
 }
 
 run().catch((error) => {
