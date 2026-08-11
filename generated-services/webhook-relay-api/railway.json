@@ -1,0 +1,8 @@
+{
+  "build": {
+    "env": {
+      "DATABASE_URL": "@DATABASE_URL",
+      "PORT": "3000"
+    }
+  }
+}
