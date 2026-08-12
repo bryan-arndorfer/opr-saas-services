@@ -1,49 +1,60 @@
-require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
-const { Pool } = require('pg');
+const { Client } = require('pg');
+const dotenv = require('dotenv');
+const bcrypt = require('bcrypt');
 const app = express();
-const port = process.env.PORT || 3000;
 
-const pool = new Pool({
+dotenv.config();
+
+const PORT = process.env.PORT || 3000;
+const client = new Client({
   connectionString: process.env.DATABASE_URL,
 });
 
-// Middleware
-app.use(cors());
+client.connect();
+
 app.use(bodyParser.json());
 
-// Rate limiting for free tier
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 100,
-  message: 'Rate limit exceeded. Try again later.',
-});
+const API_KEYS = new Map(); // Simulated API keys storage
+const RATE_LIMIT = 100; // Free tier limit
+const API_KEY_HEADER = 'x-api-key';
 
-app.use('/api/events', limiter);
-
-// Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'UP' });
+  res.status(200).json({ status: 'UP', timestamp: new Date() });
 });
 
-// Core endpoint for handling webhook events
-app.post('/api/events', async (req, res) => {
-  const { url, payload } = req.body;
+app.post('/events', async (req, res) => {
+  const apiKey = req.headers[API_KEY_HEADER];
+  const currentUsage = (API_KEYS.get(apiKey) || 0);
 
-  // Input validation
-  if (!url || !payload) {
-    return res.status(400).json({ error: 'Missing url or payload' });
+  if (currentUsage >= RATE_LIMIT) {
+    return res.status(429).json({ error: 'Rate limit exceeded' });
+  }
+  
+  const { event, targetUrl } = req.body;
+
+  if (!event || !targetUrl) {
+    return res.status(400).json({ error: 'Invalid input' });
   }
 
-  // Here you would normally add the logic to send the payload to the URL with retries
+  // Logic for storing the event and setting up delivery with exponential backoff goes here.
 
-  res.status(202).json({ message: 'Event accepted' });
+  API_KEYS.set(apiKey, currentUsage + 1); // Increment usage
+  res.status(202).json({ message: 'Event received and processing started.' });
 });
 
-// Start server
-app.listen(port, () => {
-  console.log(`Webhook Relay API listening at http://localhost:${port}`);
+app.post('/register', (req, res) => {
+  const { apiKey } = req.body;
+  if (!apiKey) {
+    return res.status(400).json({ error: 'API key is required' });
+  }
+
+  const hashedKey = bcrypt.hashSync(apiKey, 10);
+  API_KEYS.set(hashedKey, 0); // Register new API key
+  res.status(201).json({ message: 'API key registered successfully' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
 });
