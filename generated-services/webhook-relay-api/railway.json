@@ -1,14 +1,8 @@
 {
   "build": {
-    "environment": {
-      "DATABASE_URL": "postgres://user:password@localhost:5432/mydatabase",
-      "STRIPE_SECRET_KEY": "your_stripe_secret_key"
+    "env": {
+      "DATABASE_URL": "your_database_url",
+      "SECRET_KEY": "your_secret"
     }
-  },
-  "deploy": {
-    "commands": [
-      "npm install",
-      "npm start"
-    ]
   }
 }
