@@ -1,0 +1,8 @@
+{
+  "build": {
+    "env": {
+      "DATABASE_URL": "your_database_url",
+      "STRIPE_SECRET_KEY": "your_stripe_secret_key"
+    }
+  }
+}
