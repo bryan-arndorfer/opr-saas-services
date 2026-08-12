@@ -1,21 +1,27 @@
 # Webhook Relay API
 
-## Overview
+A self-serve HTTP API for reliable webhook delivery with retries and logging.
 
-A self-serve HTTP API for reliable webhook delivery. This API allows developers to send events to registered endpoint URLs with retries, logging, and error handling.
+## Features
 
-## Getting Started
+- Reliable callback delivery with exponential backoff retries.
+- HMAC signing and delivery logs.
+- API-driven registration and key generation.
+- Free tier with 100 events per month.
 
-1. Clone the repository
-2. Set up your environment variables in a `.env` file
-3. Run `npm install`
-4. Start the server with `npm start`
+## Getting started
 
-## API Endpoints
+1. Clone the repository.
+2. Run `npm install` to install the dependencies.
+3. Set up your environment variables in a `.env` file.
+4. Start the server with `npm start`.
 
-- `GET /api/health` - Health check endpoint
-- `POST /api/events` - Accepts webhook events for delivery
+## Endpoints
+
+- `GET /api/health`: Check the health of the service.
+- `POST /events`: Send events to be delivered.
+- `POST /register`: Register a new API key for usage.
 
 ## License
 
-MIT License
+This project is licensed under the MIT License.
